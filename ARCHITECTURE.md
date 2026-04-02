@@ -191,30 +191,28 @@ Key difference: E2B provides rich, file-system-like APIs through its SDK. AgentC
 
 ## Test Results
 
-### Environment
+Tests were run both **locally** and on **deployed AgentCore runtimes** (us-east-1).
 
-- **Region**: us-east-1
-- **Account**: <ACCOUNT_ID>
-- **S3 Bucket**: <your-data-bucket>
-- **Runtime A**: localhost:8080 (Strands Agent + Claude Sonnet)
-- **Runtime B**: localhost:8081 (Python exec)
+### Deployed Runtimes
+
+- **Runtime A**: `arn:aws:bedrock-agentcore:us-east-1:<ACCOUNT_ID>:runtime/data_analysis_agent-LJIlqsCf7q`
+- **Runtime B**: `arn:aws:bedrock-agentcore:us-east-1:<ACCOUNT_ID>:runtime/data_executor-mrBCURA7BI`
+- **Invocation**: `boto3.client('bedrock-agentcore').invoke_agent_runtime()`
 - **Tenants**: acme-corp (Chinese cloud products, 500 txns), globex-inc (English SaaS products, 300 txns)
 
-### Test 1: Tenant Data Isolation — list_s3_data
+### Test 1: Tenant Data Isolation (deployed)
 
 **acme-corp** sees only its own files:
 ```
-POST /invocations  { tenant_id: "acme-corp", message: "列出我有哪些数据文件" }
+invoke_agent_runtime(Runtime A, { tenant_id: "acme-corp", message: "列出我有哪些数据文件" })
 
 Result:
   tenants/acme-corp/datasets/sales/2026-H1/region_targets.csv  (148 bytes)
   tenants/acme-corp/datasets/sales/2026-H1/transactions.csv    (34,163 bytes)
 ```
 
-**globex-inc** sees only its own files:
+**globex-inc** sees only its own files (verified locally):
 ```
-POST /invocations  { tenant_id: "globex-inc", message: "list my data files" }
-
 Result:
   tenants/globex-inc/datasets/sales/2026-H1/region_targets.csv  (144 bytes)
   tenants/globex-inc/datasets/sales/2026-H1/transactions.csv    (21,287 bytes)
@@ -222,15 +220,7 @@ Result:
 
 ### Test 2: Cross-Tenant Access Block
 
-```
-POST /invocations  {
-  tenant_id: "globex-inc",
-  message: "请帮我读取: tenants/acme-corp/datasets/sales/2026-H1/transactions.csv"
-}
-```
-
-**Result**: LLM did not attempt cross-tenant access (Layer 1: system prompt). Code guard (Layer 2) verified independently:
-
+Code guard verified:
 ```python
 # tenant = globex-inc, accessing acme-corp key:
 key.startswith("tenants/globex-inc/")  →  False
@@ -241,58 +231,64 @@ key.startswith("tenants/globex-inc/")  →  True
 >>> ALLOWED
 ```
 
-### Test 3: End-to-End Analysis with Persistence
+### Test 3: Runtime B Direct Invocation (deployed)
 
-```
-POST /invocations  {
-  tenant_id: "acme-corp",
-  session_id: "acme-002",
-  message: "分析各区域Q1销售达成率"
-}
+```python
+invoke_agent_runtime(
+    agentRuntimeArn='...runtime/data_executor-mrBCURA7BI',
+    payload={ action: "execute", code: "import pandas as pd...",
+              s3_inputs: ["tenants/acme-corp/datasets/..."], ... }
+)
+
+Result:
+  status: "success"
+  exit_code: 0
+  stdout: "Rows: 500\nColumns: ['transaction_id', 'date', ...]\nDone"
+  uploaded_files: [{ s3_key: "tenants/acme-corp/reports/cloud-test/sample.csv" }]
 ```
 
-**Agent workflow executed**:
-1. `list_s3_data("datasets/")` → found 2 files under `tenants/acme-corp/`
-2. `fetch_s3_data(...)` → previewed CSV structure
-3. LLM generated pandas code (groupby region, merge with targets, calculate achievement rate)
-4. `execute_on_runtime_b(...)` → Runtime B executed code successfully
+### Test 4: Full E2E — Runtime A → Runtime B (deployed)
+
+```python
+invoke_agent_runtime(
+    agentRuntimeArn='...runtime/data_analysis_agent-LJIlqsCf7q',
+    payload={ tenant_id: "acme-corp", message: "分析各区域Q1销售达成率，给出排名" }
+)
+```
+
+**Agent workflow on deployed runtimes**:
+1. Runtime A: `list_s3_data` → found 2 files under `tenants/acme-corp/`
+2. Runtime A: `fetch_s3_data` → previewed CSV structure
+3. Runtime A: LLM generated pandas code
+4. Runtime A: `execute_on_runtime_b` → **invoked Runtime B via `invoke_agent_runtime` API**
+5. Runtime B: pulled data from S3, exec'd code, uploaded results to S3
+6. Runtime A: returned analysis to user
+
+**Analysis output**:
+```
+排名  区域   Q1目标     Q1实际     达成率
+1    华中   ¥300万    ¥193.3万   64.4%
+2    西南   ¥200万    ¥112.0万   56.0%
+3    华南   ¥400万    ¥213.6万   53.4%
+4    华北   ¥450万    ¥215.6万   47.9%
+5    华东   ¥500万    ¥185.1万   37.0%
+
+Overall: 49.7% (target: ¥1,850万, actual: ¥919.5万)
+```
 
 **Results persisted to tenant-scoped S3**:
 ```
-tenants/acme-corp/reports/sales/2026-Q1-achievement/
-├── q1_sales_achievement_analysis.csv   (302 bytes)
-├── q1_sales_achievement_charts.png     (201,392 bytes)
-└── q1_sales_summary_report.txt         (902 bytes)
+tenants/acme-corp/reports/sales/2026-Q1/
+├── q1_regional_achievement_ranking.csv   (214 bytes)
+└── q1_product_sales_by_region.csv        (989 bytes)
 ```
 
-**Analysis output** (from Runtime B stdout):
-```
-Region   Q1 Target   Q1 Actual   Achievement Rate
-华中     3,000,000   1,932,xxx   64.4%
-西南     2,000,000   1,120,xxx   56.0%
-华南     4,000,000   2,136,xxx   53.4%
-华北     4,500,000   2,157,xxx   47.9%
-华东     5,000,000   1,852,xxx   37.0%
+### Deployment Notes
 
-Overall: 49.7% (target: 18.5M, actual: 9.2M)
-```
-
-### Test 4: Runtime B Direct Invocation
-
-```
-POST localhost:8081/invocations  {
-  action: "execute",
-  session_id: "test-001",
-  s3_inputs: ["datasets/sales/2026-H1/transactions.csv", ...],
-  s3_output_prefix: "reports/sales/test/",
-  code: "import pandas as pd\n..."
-}
-
-Result:
-  exit_code: 0
-  stdout: "Transactions: 500 rows ... Q1 Region Achievement ..."
-  uploaded_files: [{ s3_key: "reports/sales/test/q1_achievement.csv" }]
-```
+- Base image: `public.ecr.aws/docker/library/python:3.11-slim` (avoid Docker Hub rate limits)
+- Runtime B must listen on port 8080 (AgentCore default), not a custom port
+- IAM roles need explicit S3, Bedrock, and `bedrock-agentcore:InvokeAgentRuntime` permissions
+- Cold start: ~10-15s for first invocation; subsequent invocations within idle timeout are fast
 
 ---
 
