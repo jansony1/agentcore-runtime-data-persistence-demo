@@ -175,37 +175,81 @@ Runtime A (1 个部署)          Runtime B (1 个部署)
 
 ## Verified Test Results
 
-### Local E2E Test
+### Deployed E2E Test (AgentCore, us-east-1)
 
-```
-curl -N -X POST http://localhost:8080/invocations \
-  -d '{"tenant_id":"acme-corp","message":"分析各区域Q1销售达成率，给出排名和改进建议"}'
+**Deployed Runtimes:**
+- Runtime A: `arn:aws:bedrock-agentcore:us-east-1:<ACCOUNT_ID>:runtime/data_router_v3-FBOLqODKUr`
+- Runtime B: `arn:aws:bedrock-agentcore:us-east-1:<ACCOUNT_ID>:runtime/data_workstation_v3-k2h6743g84`
+
+```python
+resp = client.invoke_agent_runtime(
+    agentRuntimeArn=RUNTIME_A_ARN,
+    payload={"tenant_id": "acme-corp", "message": "分析各区域Q1销售达成率，给出排名和改进建议"},
+    accept="text/event-stream",
+)
 ```
 
-**SSE Output:**
+**SSE Output (actual):**
 ```
 [analysis] Agent 开始分析...
-           (Phase 1: Agent A 多次调 Runtime B shell/python, 阻塞约60-90秒)
+           Phase 1: Agent A (Opus 4.6) 多次 invoke_agent_runtime(Runtime B):
+             → shell("aws s3 cp ...") → 下载数据
+             → shell("head ...") → 预览结构
+             → python("import pandas ...") → 分析计算
+             → python("import matplotlib ...") → 生成图表
+           全部决策在 Agent A，Runtime B 只执行返回结果
 [analysis] 数据分析完成
 [report]   正在生成分析报告...
 [report]   正在生成分析报告 (Opus 4.6 streaming)...
-[chunk]    # 📊 Q1 各区域销售达成率专业分析报告
+[chunk]    # ACME Corp 2026 Q1 各区域销售达成率分析报告 ...
 [chunk]    ## 一、概述 ...
 [chunk]    ## 二、关键发现 ...
-[chunk]    ## 三、区域排名 ...
-[chunk]    ## 四、改进建议 ...
-           (约1300+ chunks 流式输出)
-[done]     4 files → S3
+           (943 chunks, 3657 chars 流式输出)
+[done]     5 files → S3
 ```
 
-**S3 Output:**
+**Report Preview (deployed output):**
+```markdown
+# ACME Corp 2026 Q1 各区域销售达成率分析报告
+
+## 一、概述
+2026年第一季度，公司整体销售表现严重低于预期。全公司Q1实际销售收入为
+¥919.5万，仅完成 ¥1,850万 年度Q1目标的 49.70%，总销售缺口高达 ¥930 万。
+
+## 二、关键发现
+| 排名 | 区域 | 达成率 | 实际销售 | 季度目标 | 缺口金额 |
+|:---:|:---:|:---:|---:|---:|---:|
+| 1 | 华中 | 64.42% | ¥193万 | ¥300万 | -¥107万 |
+| 2 | 西南 | 56.00% | ¥112万 | ¥200万 | -¥88万 |
+| 3 | 华南 | 53.40% | ¥214万 | ¥400万 | -¥186万 |
+| 4 | 华北 | 47.90% | ¥216万 | ¥450万 | -¥234万 |
+| 5 | 华东 | 37.00% | ¥185万 | ¥500万 | -¥315万 |
+```
+
+**S3 Persisted Output:**
 ```
 tenants/acme-corp/reports/
-├── analysis_report.md                      ← 流式生成的完整报告
+├── analysis_report.md                      ← Opus 4.6 流式生成的深度报告
 ├── q1_region_achievement_summary.csv       ← Agent A 指挥 Runtime B 生成
 ├── q1_sales_achievement_analysis.png       ← Agent A 指挥 Runtime B 生成
-└── q1_q2_comparison.png                    ← Agent A 指挥 Runtime B 生成
+├── q1_monthly_detail.csv                   ← Agent A 指挥 Runtime B 生成
+└── q1_product_detail.csv                   ← Agent A 指挥 Runtime B 生成
 ```
+
+### Local E2E Test (also verified)
+
+Same pipeline verified locally (Runtime B on :8081, Runtime A on :8080).
+
+### Deployment Pitfalls (fixed)
+
+| 问题 | 原因 | 修复 |
+|------|------|------|
+| `runtimeSessionId` validation error | 最少 33 字符，短 UUID 不够 | 改用完整 UUID `str(uuid.uuid4())` |
+| `contextvars` 在 tool 线程中丢失 | Strands Agent 在线程池执行 tool，ContextVar 不传播 | 改用模块级变量（单请求 microVM 安全） |
+| `converse_stream` model ID invalid | 需要 inference profile ID，不是直接 model ID | 使用 `us.anthropic.claude-opus-4-6-v1` |
+| Runtime B 502 | 监听 8081 而非 AgentCore 默认 8080 | 修正端口 |
+| CodeBuild Docker Hub 429 | 限流 | 改用 `public.ecr.aws` 基础镜像 |
+| AWS_REGION 被覆盖 | 环境变量 `AWS_DEFAULT_REGION` 优先级 | 部署时显式设置 `AWS_REGION` |
 
 ---
 
