@@ -17,7 +17,6 @@ import os
 import json
 import logging
 import uuid
-import contextvars
 from typing import Optional
 
 import boto3
@@ -42,15 +41,15 @@ app = BedrockAgentCoreApp()
 agentcore_dp = boto3.client("bedrock-agentcore", region_name=REGION,
                             config=Config(read_timeout=300))
 
-# ---------- Context ----------
-_tenant_id_var: contextvars.ContextVar[str] = contextvars.ContextVar("tenant_id", default="default")
-_session_id_var: contextvars.ContextVar[str] = contextvars.ContextVar("session_id", default="default")
+# ---------- Context (module-level, safe for single-request-per-microVM) ----------
+_current_tenant_id = "default"
+_current_session_id = "default"
 
 def get_tenant_id() -> str:
-    return _tenant_id_var.get()
+    return _current_tenant_id
 
 def get_session_id() -> str:
-    return _session_id_var.get()
+    return _current_session_id
 
 
 # ---------- Runtime B Invocation ----------
@@ -220,15 +219,16 @@ def resolve_tenant_id(payload: dict, context: RequestContext) -> str:
 def invoke(payload: dict, context: RequestContext):
     """Generator → SSE. Phase 1: Agent analysis. Phase 2: Report streaming."""
     tenant_id = resolve_tenant_id(payload, context)
-    session_id = context.session_id or payload.get("session_id", uuid.uuid4().hex[:8])
+    session_id = context.session_id or payload.get("session_id", str(uuid.uuid4()))
     message = payload.get("message", "")
 
     if not message:
         yield {"type": "error", "message": "请提供分析请求"}
         return
 
-    _tenant_id_var.set(tenant_id)
-    _session_id_var.set(session_id)
+    global _current_tenant_id, _current_session_id
+    _current_tenant_id = tenant_id
+    _current_session_id = session_id
     s3_prefix = f"tenants/{tenant_id}/datasets/"
     s3_output_prefix = f"tenants/{tenant_id}/reports/"
 
