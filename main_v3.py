@@ -1,8 +1,16 @@
 """
-Runtime A V3 — Router + SSE Forwarding
+Runtime A V3 — Agent A (The Only Brain)
 
-Receives user requests, routes to Runtime B V3, and forwards SSE stream back to user.
-Uses Sonnet for lightweight task classification.
+Agent A is the sole decision-maker. It controls Runtime B through tools:
+  - runtime_b_shell: execute shell commands on Runtime B
+  - runtime_b_python: execute Python code on Runtime B
+
+After Agent A completes analysis, the entrypoint invokes Runtime B's
+report action and forwards the SSE stream to the frontend.
+
+Flow:
+  Phase 1 (blocking): Agent A tool loop → shell/python on Runtime B
+  Phase 2 (streaming): Forward Runtime B report SSE → frontend
 """
 
 import os
@@ -14,14 +22,14 @@ from typing import Optional
 
 import boto3
 from botocore.config import Config
-from strands import Agent
+from strands import Agent, tool
 from strands.models import BedrockModel
 from bedrock_agentcore.runtime import BedrockAgentCoreApp, RequestContext
 
 # ---------- Config ----------
 REGION = os.environ.get("AWS_REGION", "us-east-1")
 BUCKET = os.environ.get("DATA_BUCKET", "")
-SONNET_MODEL_ID = os.environ.get("MODEL_ID", "us.anthropic.claude-sonnet-4-20250514-v1:0")
+MODEL_ID = os.environ.get("MODEL_ID", "us.anthropic.claude-opus-4-6-v1")
 RUNTIME_B_ARN = os.environ.get("RUNTIME_B_ARN", "")
 
 if not BUCKET:
@@ -32,111 +40,166 @@ logger = logging.getLogger(__name__)
 
 app = BedrockAgentCoreApp()
 agentcore_dp = boto3.client("bedrock-agentcore", region_name=REGION,
-                            config=Config(read_timeout=600))
+                            config=Config(read_timeout=300))
 
-# ---------- Tenant Context ----------
+# ---------- Context ----------
 _tenant_id_var: contextvars.ContextVar[str] = contextvars.ContextVar("tenant_id", default="default")
-
-def set_tenant(tenant_id: str):
-    _tenant_id_var.set(tenant_id)
+_session_id_var: contextvars.ContextVar[str] = contextvars.ContextVar("session_id", default="default")
 
 def get_tenant_id() -> str:
     return _tenant_id_var.get()
 
-
-# ---------- Task Classification ----------
-
-CLASSIFY_PROMPT = """你是一个任务分类器。根据用户输入，判断任务类型。只返回一个分类标签，不要解释。
-
-分类:
-- data_analysis: 数据分析、统计、报表、达成率、趋势分析
-- general: 其他
-
-用户输入: {message}
-
-分类标签:"""
+def get_session_id() -> str:
+    return _session_id_var.get()
 
 
-def classify_task(message: str) -> str:
-    """Lightweight Sonnet call to classify task type."""
-    try:
-        bedrock = boto3.client("bedrock-runtime", region_name=REGION)
-        response = bedrock.converse(
-            modelId=SONNET_MODEL_ID,
-            messages=[{"role": "user", "content": [{"text": CLASSIFY_PROMPT.format(message=message)}]}],
-        )
-        label = response["output"]["message"]["content"][0]["text"].strip().lower()
-        if "data" in label or "analysis" in label:
-            return "data_analysis"
-        return label
-    except Exception as e:
-        logger.warning(f"Classification failed, defaulting to data_analysis: {e}")
-        return "data_analysis"
+# ---------- Runtime B Invocation ----------
+
+def invoke_runtime_b(action: str, payload_extra: dict) -> dict:
+    """Invoke Runtime B with an action. Returns parsed JSON response."""
+    session_id = get_session_id()
+    payload = {"action": action, **payload_extra}
+
+    if not RUNTIME_B_ARN:
+        return _invoke_local(payload)
+
+    response = agentcore_dp.invoke_agent_runtime(
+        agentRuntimeArn=RUNTIME_B_ARN,
+        payload=json.dumps(payload).encode("utf-8"),
+        contentType="application/json",
+        runtimeSessionId=session_id,
+        qualifier="DEFAULT",
+    )
+    body = response["response"].read().decode("utf-8")
+    return json.loads(body)
 
 
-# ---------- SSE Forwarding ----------
+def _invoke_local(payload: dict) -> dict:
+    """Local dev: call Runtime B via HTTP."""
+    import urllib.request
+    url = os.environ.get("RUNTIME_B_URL", "http://localhost:8081/invocations")
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=120) as resp:
+        return json.loads(resp.read().decode("utf-8"))
 
-def invoke_runtime_b_streaming(tenant_id: str, task: str):
-    """Call Runtime B V3 and yield SSE events as they arrive."""
 
+def invoke_runtime_b_report_stream(context: str, s3_output_prefix: str):
+    """Invoke Runtime B report action and yield SSE events."""
+    session_id = get_session_id()
     payload = json.dumps({
-        "tenant_id": tenant_id,
-        "task": task,
-        "s3_data_prefix": f"tenants/{tenant_id}/datasets/",
+        "action": "report",
+        "context": context,
+        "s3_output_prefix": s3_output_prefix,
     }).encode("utf-8")
 
     if not RUNTIME_B_ARN:
-        # Local dev: HTTP call to localhost
-        yield from _invoke_local_streaming(payload)
+        yield from _invoke_local_stream(payload)
         return
 
-    try:
-        response = agentcore_dp.invoke_agent_runtime(
-            agentRuntimeArn=RUNTIME_B_ARN,
-            payload=payload,
-            contentType="application/json",
-            accept="text/event-stream",
-            qualifier="DEFAULT",
-        )
-
-        # StreamingBody → parse SSE lines → yield events
-        for line in response["response"].iter_lines():
-            if line:
-                line_str = line.decode("utf-8") if isinstance(line, bytes) else line
-                if line_str.startswith("data: "):
-                    event_data = line_str[6:]
-                    try:
-                        yield json.loads(event_data)
-                    except json.JSONDecodeError:
-                        yield {"type": "raw", "content": event_data}
-
-    except Exception as e:
-        logger.error(f"Runtime B invocation failed: {e}", exc_info=True)
-        yield {"type": "error", "message": f"Runtime B 调用失败: {str(e)}"}
-
-
-def _invoke_local_streaming(payload: bytes):
-    """Local dev: call Runtime B via HTTP and parse SSE response."""
-    import urllib.request
-
-    runtime_b_url = os.environ.get("RUNTIME_B_URL", "http://localhost:8081/invocations")
-    req = urllib.request.Request(
-        runtime_b_url, data=payload,
-        headers={"Content-Type": "application/json", "Accept": "text/event-stream"},
+    response = agentcore_dp.invoke_agent_runtime(
+        agentRuntimeArn=RUNTIME_B_ARN,
+        payload=payload,
+        contentType="application/json",
+        accept="text/event-stream",
+        runtimeSessionId=session_id,
+        qualifier="DEFAULT",
     )
+    for line in response["response"].iter_lines():
+        if line:
+            line_str = line.decode("utf-8") if isinstance(line, bytes) else line
+            if line_str.startswith("data: "):
+                try:
+                    yield json.loads(line_str[6:])
+                except json.JSONDecodeError:
+                    yield {"type": "raw", "content": line_str[6:]}
 
-    try:
-        with urllib.request.urlopen(req, timeout=600) as resp:
-            for raw_line in resp:
-                line = raw_line.decode("utf-8").strip()
-                if line.startswith("data: "):
-                    event_data = line[6:]
-                    try:
-                        yield json.loads(event_data)
-                    except json.JSONDecodeError:
-                        yield {"type": "raw", "content": event_data}
-    except Exception as e:
-        yield {"type": "error", "message": f"Local Runtime B call failed: {str(e)}"}
+
+def _invoke_local_stream(payload: bytes):
+    """Local dev: stream from Runtime B via HTTP."""
+    import urllib.request
+    url = os.environ.get("RUNTIME_B_URL", "http://localhost:8081/invocations")
+    req = urllib.request.Request(url, data=payload,
+                                headers={"Content-Type": "application/json", "Accept": "text/event-stream"})
+    with urllib.request.urlopen(req, timeout=600) as resp:
+        for raw_line in resp:
+            line = raw_line.decode("utf-8").strip()
+            if line.startswith("data: "):
+                try:
+                    yield json.loads(line[6:])
+                except json.JSONDecodeError:
+                    yield {"type": "raw", "content": line[6:]}
+
+
+# ---------- Agent Tools (remote control Runtime B) ----------
+
+@tool
+def runtime_b_shell(command: str) -> str:
+    """Execute a shell command on Runtime B's workspace.
+
+    Use for: aws s3 cp, head, tail, wc, sort, ls, cat, file inspection, pip install.
+    The workspace persists across calls within the same session.
+    Working directory is /tmp/workspace.
+
+    Args:
+        command: Shell command to execute
+
+    Returns:
+        JSON with stdout, stderr, exit_code
+    """
+    result = invoke_runtime_b("shell", {"command": command})
+    logger.info(f"Shell [{result.get('exit_code')}]: {command[:80]}")
+    return json.dumps(result, ensure_ascii=False)
+
+
+@tool
+def runtime_b_python(code: str) -> str:
+    """Execute Python code on Runtime B's workspace.
+
+    The WORKSPACE variable is available as '/tmp/workspace'.
+    Files written to WORKSPACE persist across calls.
+    Write output files to WORKSPACE + '/output/' for S3 upload.
+
+    Use for: pandas analysis, numpy computation, matplotlib charts.
+
+    Args:
+        code: Python code to execute. Use WORKSPACE variable for file paths.
+
+    Returns:
+        JSON with stdout, stderr, exit_code, output_files
+    """
+    result = invoke_runtime_b("python", {"code": code})
+    logger.info(f"Python [{result.get('exit_code')}]: {len(code)} chars")
+    return json.dumps(result, ensure_ascii=False)
+
+
+# ---------- System Prompt ----------
+
+SYSTEM_PROMPT = f"""你是一个数据分析 Agent，你是唯一的决策者。
+
+## 你的工具
+1. **runtime_b_shell** — 在远程工作站上执行 shell 命令
+   - 工作目录: /tmp/workspace（持久化，跨调用共享）
+   - 用于: aws s3 cp, head, wc, sort, ls, cat 等
+2. **runtime_b_python** — 在远程工作站上执行 Python 代码
+   - 可用变量: WORKSPACE = "/tmp/workspace"
+   - 输出文件写到: WORKSPACE + "/output/"
+   - 可用库: pandas, numpy, matplotlib
+
+## 工作流程
+1. 用 runtime_b_shell 从 S3 下载数据到工作站
+2. 用 runtime_b_shell 预览数据结构 (head, wc 等)
+3. 用 runtime_b_python 执行 pandas 分析
+4. 如果代码报错，阅读 stderr，修正代码，重试（最多 3 次）
+5. 用 runtime_b_python 生成 matplotlib 图表，保存到 /tmp/workspace/output/
+6. 用 print() 输出所有关键发现（数字、排名、结论），这些会被用于生成最终报告
+
+## 重要规则
+- 数据桶: s3://{BUCKET}/
+- 总是 print() 关键分析结论和数据表格
+- 图表和 CSV 保存到 /tmp/workspace/output/
+- 你的输出会被传给报告生成器，所以要尽可能详细和有数据支撑
+"""
 
 
 # ---------- Tenant Resolution ----------
@@ -148,36 +211,59 @@ def resolve_tenant_id(payload: dict, context: RequestContext) -> str:
         for k, v in context.request_headers.items():
             if k.lower() == CUSTOM_TENANT_HEADER:
                 return v
-    if payload.get("tenant_id"):
-        return payload["tenant_id"]
-    return "default"
+    return payload.get("tenant_id", "default")
 
 
 # ---------- Entrypoint ----------
 
 @app.entrypoint
 def invoke(payload: dict, context: RequestContext):
-    """Generator entrypoint → SSE streaming response."""
+    """Generator → SSE. Phase 1: Agent analysis. Phase 2: Report streaming."""
     tenant_id = resolve_tenant_id(payload, context)
     session_id = context.session_id or payload.get("session_id", uuid.uuid4().hex[:8])
-    message = payload.get("message", payload.get("task", ""))
+    message = payload.get("message", "")
 
     if not message:
         yield {"type": "error", "message": "请提供分析请求"}
         return
 
-    set_tenant(tenant_id)
-    logger.info(f"Tenant: {tenant_id} | Session: {session_id} | Query: {message[:80]}...")
+    _tenant_id_var.set(tenant_id)
+    _session_id_var.set(session_id)
+    s3_prefix = f"tenants/{tenant_id}/datasets/"
+    s3_output_prefix = f"tenants/{tenant_id}/reports/"
 
-    # Classify task
-    task_type = classify_task(message)
-    logger.info(f"Task type: {task_type}")
+    logger.info(f"Tenant: {tenant_id} | Session: {session_id} | Query: {message[:80]}")
 
-    if task_type == "data_analysis":
-        yield {"type": "status", "stage": "router", "message": f"任务类型: 数据分析，正在转发到分析工作站..."}
-        yield from invoke_runtime_b_streaming(tenant_id, message)
-    else:
-        yield {"type": "status", "stage": "router", "message": f"暂不支持的任务类型: {task_type}"}
+    # === Phase 1: Agent-driven analysis (blocking) ===
+    yield {"type": "status", "stage": "analysis", "message": "Agent 开始分析..."}
+
+    agent = Agent(
+        model=BedrockModel(model_id=MODEL_ID, streaming=False),
+        tools=[runtime_b_shell, runtime_b_python],
+        system_prompt=SYSTEM_PROMPT,
+    )
+
+    try:
+        analysis_result = str(agent(
+            f"租户数据在 S3: s3://{BUCKET}/{s3_prefix}\n"
+            f"请下载数据并完成以下分析任务: {message}\n"
+            f"输出文件保存到 /tmp/workspace/output/"
+        ))
+        logger.info(f"Agent analysis complete: {len(analysis_result)} chars")
+    except Exception as e:
+        logger.error(f"Agent error: {e}", exc_info=True)
+        yield {"type": "error", "stage": "analysis", "message": str(e)}
+        return
+
+    yield {"type": "status", "stage": "analysis", "message": "数据分析完成"}
+
+    # === Phase 2: Report streaming (forward SSE from Runtime B) ===
+    yield {"type": "status", "stage": "report", "message": "正在生成分析报告..."}
+
+    yield from invoke_runtime_b_report_stream(
+        context=analysis_result,
+        s3_output_prefix=s3_output_prefix,
+    )
 
 
 if __name__ == "__main__":
