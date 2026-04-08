@@ -1,4 +1,4 @@
-# AgentCore Data Analysis Demo — Architecture & Test Report
+# AgentCore Data Analysis Demo — Architecture & Test Report (V1)
 
 ## Overview
 
@@ -19,7 +19,7 @@ S3 serves as the shared filesystem (analogous to E2B's sandbox filesystem), with
                          └──────────────────┬──────────────────────┘
                                             │
                     ┌───────────────────────────────────────────────────┐
-                    │         AgentCore Runtime A (port 8080)           │
+                    │         AgentCore Runtime A                       │
                     │         Framework Worker — Strands Agent          │
                     │                                                   │
                     │  ┌─────────────┐                                  │
@@ -29,7 +29,7 @@ S3 serves as the shared filesystem (analogous to E2B's sandbox filesystem), with
                     │  └──────┬──────┘    2. Payload field              │
                     │         │           3. Fallback "default"         │
                     │         ▼                                         │
-                    │  ┌─────────────┐  contextvars propagation         │
+                    │  ┌─────────────┐                                  │
                     │  │ set_tenant()│──────────────────────────┐       │
                     │  └──────┬──────┘                          │       │
                     │         │                                 ▼       │
@@ -46,11 +46,10 @@ S3 serves as the shared filesystem (analogous to E2B's sandbox filesystem), with
                     │                             │                    │
                     └─────────────────────────────┼────────────────────┘
                                                   │
-                          invoke_agent_runtime     │  (deployed)
-                          or HTTP POST             │  (local dev)
+                          invoke_agent_runtime     │
                                                   │
                     ┌─────────────────────────────┼────────────────────┐
-                    │         AgentCore Runtime B  (port 8081)         │
+                    │         AgentCore Runtime B                       │
                     │         Code Executor — No LLM                   │
                     │                             │                    │
                     │                             ▼                    │
@@ -67,7 +66,6 @@ S3 serves as the shared filesystem (analogous to E2B's sandbox filesystem), with
                                             ▼
                     ┌───────────────────────────────────────────────────┐
                     │                    S3 Bucket                      │
-                    │       <your-data-bucket>            │
                     │                                                   │
                     │   tenants/                                        │
                     │   ├── acme-corp/                                  │
@@ -97,7 +95,7 @@ User: "分析各区域Q1销售达成率"  (tenant_id=acme-corp, session_id=acme-
 ▼
 Runtime A entrypoint:
 │  resolve_tenant_id() → "acme-corp"
-│  set_tenant("acme-corp", "acme-002") → stored in contextvars
+│  set_tenant("acme-corp", "acme-002")
 │  build_system_prompt("acme-corp") → tenant-aware prompt
 │  create Strands Agent with tools
 │
@@ -122,13 +120,11 @@ Runtime A entrypoint:
 │   │  guard: all s3_inputs start with "tenants/acme-corp/" ✓
 │   │  full_output_prefix → "tenants/acme-corp/reports/sales/2026-Q1-achievement/"
 │   │
-│   └── invoke Runtime B (HTTP POST /invocations):
+│   └── invoke_agent_runtime(Runtime B):
 │       │  payload: { action, code, s3_inputs, s3_output_prefix, tenant_id, session_id }
-│       │
 │       ▼
 │       Runtime B:
 │       │  workspace = /tmp/workspace/acme-corp/acme-002/
-│       │  mkdir input/ output/
 │       │  S3 download → input/transactions.csv, input/region_targets.csv
 │       │  exec(code) with INPUT_DIR, OUTPUT_DIR
 │       │  S3 upload output/* → tenants/acme-corp/reports/sales/2026-Q1-achievement/
@@ -165,7 +161,7 @@ Priority:
 3. Fallback: "default"
 
 Propagation:
-  Request → resolve_tenant_id() → contextvars.ContextVar → all @tool functions
+  Request → resolve_tenant_id() → all @tool functions
   Runtime A → Runtime B: tenant_id passed explicitly in invoke payload
 ```
 
@@ -189,9 +185,7 @@ Key difference: E2B provides rich, file-system-like APIs through its SDK. AgentC
 
 ---
 
-## Test Results
-
-Tests were run both **locally** and on **deployed AgentCore runtimes** (us-east-1).
+## Deployed Test Results
 
 ### Deployed Runtimes
 
@@ -200,7 +194,7 @@ Tests were run both **locally** and on **deployed AgentCore runtimes** (us-east-
 - **Invocation**: `boto3.client('bedrock-agentcore').invoke_agent_runtime()`
 - **Tenants**: acme-corp (Chinese cloud products, 500 txns), globex-inc (English SaaS products, 300 txns)
 
-### Test 1: Tenant Data Isolation (deployed)
+### Test 1: Tenant Data Isolation
 
 **acme-corp** sees only its own files:
 ```
@@ -211,7 +205,7 @@ Result:
   tenants/acme-corp/datasets/sales/2026-H1/transactions.csv    (34,163 bytes)
 ```
 
-**globex-inc** sees only its own files (verified locally):
+**globex-inc** sees only its own files:
 ```
 Result:
   tenants/globex-inc/datasets/sales/2026-H1/region_targets.csv  (144 bytes)
@@ -231,7 +225,7 @@ key.startswith("tenants/globex-inc/")  →  True
 >>> ALLOWED
 ```
 
-### Test 3: Runtime B Direct Invocation (deployed)
+### Test 3: Runtime B Direct Invocation
 
 ```python
 invoke_agent_runtime(
@@ -247,7 +241,7 @@ Result:
   uploaded_files: [{ s3_key: "tenants/acme-corp/reports/cloud-test/sample.csv" }]
 ```
 
-### Test 4: Full E2E — Runtime A → Runtime B (deployed)
+### Test 4: Full E2E — Runtime A → Runtime B
 
 ```python
 invoke_agent_runtime(
@@ -286,54 +280,54 @@ tenants/acme-corp/reports/sales/2026-Q1/
 ### Deployment Notes
 
 - Base image: `public.ecr.aws/docker/library/python:3.11-slim` (avoid Docker Hub rate limits)
-- Runtime B must listen on port 8080 (AgentCore default), not a custom port
+- Runtime B must listen on port 8080 (AgentCore default)
 - IAM roles need explicit S3, Bedrock, and `bedrock-agentcore:InvokeAgentRuntime` permissions
 - Cold start: ~10-15s for first invocation; subsequent invocations within idle timeout are fast
 
 ---
 
-## File Structure
+## Deployment
 
-```
-zoom_demo/
-├── ARCHITECTURE.md             ← This file
-├── main.py                     ← Runtime A: Strands Agent + tenant isolation
-├── runtime_b/
-│   └── main.py                 ← Runtime B: stateless code executor
-├── generate_sample_data.py     ← Generate sample data for 2 tenants
-└── requirements.txt            ← Python dependencies
+```bash
+# 1. Create S3 bucket and upload sample data
+export DATA_BUCKET=your-bucket-name
+python3 generate_sample_data.py
+
+# 2. Deploy Runtime B
+cd runtime_b
+agentcore configure --create --name "data_executor" --entrypoint "main.py" --region "us-east-1" --non-interactive
+agentcore deploy --env "DATA_BUCKET=$DATA_BUCKET" --env "AWS_REGION=us-east-1"
+# Note the ARN from output
+
+# 3. Add IAM permissions to Runtime B role
+# S3: GetObject, PutObject, ListBucket | Bedrock: InvokeModel
+
+# 4. Deploy Runtime A with Runtime B ARN
+cd ../
+agentcore configure --create --name "data_analysis_agent" --entrypoint "main.py" --region "us-east-1" --non-interactive
+agentcore deploy --env "DATA_BUCKET=$DATA_BUCKET" --env "AWS_REGION=us-east-1" --env "RUNTIME_B_ARN=<runtime-b-arn>"
+
+# 5. Add IAM permissions to Runtime A role
+# S3: GetObject, ListBucket | Bedrock: InvokeModel | AgentCore: InvokeAgentRuntime
+
+# 6. Test
+python3 -c "
+import boto3, json
+from botocore.config import Config
+client = boto3.client('bedrock-agentcore', region_name='us-east-1', config=Config(read_timeout=300))
+resp = client.invoke_agent_runtime(
+    agentRuntimeArn='RUNTIME_A_ARN',
+    payload=json.dumps({'tenant_id':'acme-corp','message':'分析Q1销售达成率'}).encode(),
+    contentType='application/json', qualifier='DEFAULT')
+print(json.loads(resp['response'].read().decode()))
+"
 ```
 
 ---
 
-## Deployment (Next Steps)
-
-### Local Development
-```bash
-# Terminal 1: Runtime B
-python3 runtime_b/main.py    # port 8081
-
-# Terminal 2: Runtime A
-python3 main.py               # port 8080
-
-# Test
-curl -X POST http://localhost:8080/invocations \
-  -H "Content-Type: application/json" \
-  -d '{"tenant_id":"acme-corp","message":"分析Q1销售达成率"}'
-```
-
-### AgentCore Deployment
-```bash
-# Deploy Runtime B first
-cd runtime_b && agentcore deploy
-# Note the ARN: arn:aws:bedrock-agentcore:us-east-1:<ACCOUNT_ID>:runtime/runtime-b-id
-
-# Deploy Runtime A with Runtime B ARN
-cd .. && RUNTIME_B_ARN=arn:aws:... agentcore deploy
-```
-
-### Future Improvements
+## Future Improvements
 - **SDK Wrapper**: Wrap `invoke_agent_runtime` into E2B-style `sandbox.execute()` / `sandbox.files.write()` API
 - **DynamoDB metadata**: Task records with tenant → S3 key mapping for historical queries
 - **S3 Bucket Policy**: IAM-level tenant isolation (in addition to code-level guards)
 - **S3 Lifecycle Policy**: Auto-archive reports after 90 days to Glacier
+- See **DESIGN_V3.md** for the evolved architecture with SSE streaming and report generation
