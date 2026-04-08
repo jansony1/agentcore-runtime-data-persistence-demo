@@ -1,149 +1,166 @@
-# AgentCore Runtime Data Persistence & Tenant Isolation Demo
+# AgentCore Dual-Runtime Data Analysis with SSE Streaming (V3)
 
-Demonstrates how to build a **dual-runtime** data analysis system on AWS Bedrock AgentCore with:
-
-- **Data persistence via S3** (not relying on AgentCore's 14-day session storage)
-- **Tenant isolation** (S3 prefix-based data separation + code-level guards)
-- **Runtime-to-Runtime invocation** (main agent delegates code execution to a separate runtime)
+A dual-runtime architecture on AWS Bedrock AgentCore where **Agent A is the sole brain** and **Runtime B is the pure executor** with shell, Python, and LLM report rendering capabilities.
 
 ## Architecture
 
 ```
-User → Runtime A (Strands Agent, generates analysis code)
-           │
-           ├── S3: fetch tenant-scoped data
-           ├── LLM: generate Python analysis code
-           ├── Runtime B: execute code (via invoke_agent_runtime or HTTP)
-           └── S3: persist results to tenant-scoped path
-
-       Runtime B (stateless code executor, no LLM)
-           └── pull S3 data → exec(code) → push results to S3
+Runtime A (Agent A = sole brain, Opus 4.6)
+  │  Strands Agent decides everything:
+  │    → runtime_b_shell("aws s3 cp ...")
+  │    → runtime_b_python("import pandas ...")
+  │    → runtime_b_python("import matplotlib ...")
+  │
+  │  invoke_agent_runtime (same session = same microVM = files persist)
+  ▼
+Runtime B (pure executor, no decision-making)
+  ├── action=shell   → subprocess.run()     → JSON response
+  ├── action=python  → exec()               → JSON response
+  └── action=report  → converse_stream(Opus 4.6) → SSE streaming
+                       ↑ renders report, does not think
 ```
 
-See [ARCHITECTURE.md](ARCHITECTURE.md) for detailed diagrams, data flow, and test results.
+**SSE end-to-end**: Runtime B streams report → Runtime A forwards → frontend sees tokens in real-time.
+
+See [DESIGN_V3.md](DESIGN_V3.md) for detailed architecture, data flow, and design decisions.
 
 ## Prerequisites
 
-- Python 3.11+
+- AWS account with Bedrock model access (Claude Opus 4.6)
 - AWS credentials configured (`aws configure`)
-- AWS account with Bedrock model access (Claude Sonnet or other supported model)
+- Python 3.11+
 - `pip install -r requirements.txt`
 
-## Quick Start
+## Deploy
 
-### 1. Create S3 Bucket
+### 1. Create S3 Bucket and Sample Data
 
 ```bash
-# Replace with your account ID
 export DATA_BUCKET=agentcore-demo-$(aws sts get-caller-identity --query Account --output text)
 aws s3 mb s3://$DATA_BUCKET --region us-east-1
-```
-
-### 2. Generate Sample Data
-
-Creates sales data for two tenants (`acme-corp` and `globex-inc`):
-
-```bash
-export DATA_BUCKET=your-bucket-name
 python3 generate_sample_data.py
 ```
 
-S3 layout after:
-```
-tenants/acme-corp/datasets/sales/2026-H1/transactions.csv      (500 rows, Chinese cloud products)
-tenants/acme-corp/datasets/sales/2026-H1/region_targets.csv
-tenants/globex-inc/datasets/sales/2026-H1/transactions.csv     (300 rows, English SaaS products)
-tenants/globex-inc/datasets/sales/2026-H1/region_targets.csv
-```
-
-### 3. Run Locally
+### 2. Deploy Runtime B (executor)
 
 ```bash
-export DATA_BUCKET=your-bucket-name
-export AWS_REGION=us-east-1
-
-# Terminal 1: Start Runtime B (code executor)
-python3 runtime_b/main.py
-
-# Terminal 2: Start Runtime A (main agent)
-python3 main.py
+cd runtime_b_v3
+agentcore configure --create --name "data_workstation_v3" --entrypoint "main.py" --region "us-east-1" --non-interactive
+# Enable ecr_auto_create and s3_auto_create in .bedrock_agentcore.yaml
+agentcore deploy \
+  --env "DATA_BUCKET=$DATA_BUCKET" \
+  --env "AWS_REGION=us-east-1" \
+  --env "OPUS_MODEL_ID=us.anthropic.claude-opus-4-6-v1"
+# Note the ARN from output
 ```
+
+Add IAM permissions to Runtime B's execution role:
+- S3: `GetObject`, `PutObject`, `ListBucket`, `DeleteObject`
+- Bedrock: `InvokeModel`, `InvokeModelWithResponseStream`
+
+### 3. Deploy Runtime A (agent brain)
+
+```bash
+cd ../runtime_a_v3
+agentcore configure --create --name "data_router_v3" --entrypoint "main.py" --region "us-east-1" --non-interactive
+# Enable ecr_auto_create and s3_auto_create in .bedrock_agentcore.yaml
+agentcore deploy \
+  --env "DATA_BUCKET=$DATA_BUCKET" \
+  --env "AWS_REGION=us-east-1" \
+  --env "RUNTIME_B_ARN=<runtime-b-arn-from-step-2>" \
+  --env "MODEL_ID=us.anthropic.claude-opus-4-6-v1"
+```
+
+Add IAM permissions to Runtime A's execution role:
+- S3: `GetObject`, `ListBucket`
+- Bedrock: `InvokeModel`, `InvokeModelWithResponseStream`
+- AgentCore: `InvokeAgentRuntime`
 
 ### 4. Test
 
-```bash
-# Tenant: acme-corp — list available data
-curl -s -X POST http://localhost:8080/invocations \
-  -H "Content-Type: application/json" \
-  -d '{"tenant_id":"acme-corp","message":"列出我有哪些数据文件"}' | python3 -m json.tool
+```python
+import boto3, json
+from botocore.config import Config
 
-# Tenant: acme-corp — run analysis
-curl -s -X POST http://localhost:8080/invocations \
-  -H "Content-Type: application/json" \
-  -d '{"tenant_id":"acme-corp","session_id":"demo-001","message":"分析各区域Q1销售达成率"}' | python3 -m json.tool
+client = boto3.client('bedrock-agentcore', region_name='us-east-1',
+                      config=Config(read_timeout=600))
 
-# Tenant: globex-inc — different tenant, isolated data
-curl -s -X POST http://localhost:8080/invocations \
-  -H "Content-Type: application/json" \
-  -d '{"tenant_id":"globex-inc","message":"analyze Q1 regional sales achievement"}' | python3 -m json.tool
+resp = client.invoke_agent_runtime(
+    agentRuntimeArn='<runtime-a-arn>',
+    payload=json.dumps({
+        'tenant_id': 'acme-corp',
+        'message': '分析各区域Q1销售达成率，给出排名和改进建议'
+    }).encode(),
+    contentType='application/json',
+    accept='text/event-stream',
+    qualifier='DEFAULT',
+)
 
-# Verify results in S3
-aws s3 ls s3://$DATA_BUCKET/tenants/ --recursive
+for line in resp['response'].iter_lines():
+    if line:
+        line_str = line.decode('utf-8')
+        if line_str.startswith('data: '):
+            event = json.loads(line_str[6:])
+            if event.get('type') == 'status':
+                print(f"[{event['stage']}] {event['message']}")
+            elif event.get('type') == 'chunk':
+                print(event['content'], end='')
+            elif event.get('type') == 'done':
+                print(f"\n\nFiles: {[f['s3_uri'] for f in event['s3_keys']]}")
 ```
 
-## Tenant Isolation
-
-Three layers of enforcement:
-
-| Layer | Location | Mechanism |
-|-------|----------|-----------|
-| System Prompt | Runtime A | LLM is told it can only access current tenant's data |
-| Code Guard | `fetch_s3_data`, `execute_on_runtime_b` | `key.startswith(f"tenants/{tenant_id}/")` check |
-| Path Prefix | `tenant_prefix()` | `list_s3_data` and `s3_output_prefix` auto-prepend tenant path |
-
-Tenant identity comes from (in priority order):
-1. AgentCore custom header: `X-Amzn-Bedrock-AgentCore-Runtime-Custom-Tenant-Id`
-2. Payload field: `tenant_id`
-3. Fallback: `"default"`
-
-## Why Not Session Storage?
-
-AgentCore Runtime's built-in session storage (14-day TTL) is designed for ephemeral compute state, not business data:
-
-| | Session Storage | S3 (this demo) |
-|---|---|---|
-| TTL | 14 days, then deleted | You control retention |
-| Version update | **Reset to clean state** | Unaffected |
-| Backup/export | Not supported | Standard S3 tools |
-| Cross-session access | No | Yes (via S3 keys) |
-| Tenant isolation | Per-session only | S3 prefix + code guards |
-
-**Rule of thumb**: Session Storage = cache (ok to lose). S3 = your data (you own the lifecycle).
-
-## Deploy to AgentCore
-
-```bash
-# Deploy Runtime B first
-cd runtime_b
-agentcore deploy
-# Note the ARN from output
-
-# Deploy Runtime A with Runtime B ARN
-cd ..
-RUNTIME_B_ARN=arn:aws:bedrock-agentcore:us-east-1:ACCOUNT:runtime/RUNTIME_B_ID agentcore deploy
+**Expected output:**
 ```
+[analysis] Agent 开始分析...
+[analysis] 数据分析完成
+[report] 正在生成分析报告...
+[report] 正在生成分析报告 (Opus 4.6 streaming)...
+# ACME Corp 2026 Q1 各区域销售达成率分析报告
+## 一、概述
+2026年第一季度，公司整体销售表现严重低于预期...
+## 二、关键发现
+| 排名 | 区域 | 达成率 | ...
+...
+
+Files: ['s3://.../analysis_report.md', 's3://.../q1_region_achievement.csv', ...]
+```
+
+## Multi-Tenancy
+
+2 Runtime deployments serve N tenants. AgentCore assigns isolated microVMs per session.
+
+| Layer | Mechanism |
+|-------|-----------|
+| Compute | AgentCore session → independent microVM (Firecracker) |
+| Data | S3 `tenants/{tenant_id}/` prefix + code guard |
+| Context | Module-level variable propagated to all tools |
 
 ## File Structure
 
 ```
 .
-├── README.md                   # This file
-├── ARCHITECTURE.md             # Detailed architecture, data flow, test results
-├── main.py                     # Runtime A: Strands Agent + tenant isolation
-├── runtime_b/
-│   └── main.py                 # Runtime B: stateless code executor
-├── generate_sample_data.py     # Generate sample data for 2 tenants
-├── requirements.txt            # Python dependencies
-├── .env.example                # Environment variable template
-└── .gitignore
+├── README.md                       # This file
+├── DESIGN_V3.md                    # Detailed architecture, data flow, test results
+├── ARCHITECTURE.md                 # V1 architecture reference
+├── runtime_a_v3/
+│   ├── main.py                     # Runtime A: Agent A (brain) + SSE forwarding
+│   ├── Dockerfile
+│   └── requirements.txt
+├── runtime_b_v3/
+│   ├── main.py                     # Runtime B: executor (shell, python, report)
+│   ├── Dockerfile
+│   └── requirements.txt
+├── generate_sample_data.py         # Generate sample data for 2 tenants
+├── main.py                         # V1 Runtime A (reference)
+├── runtime_b/                      # V1 Runtime B (reference)
+└── requirements.txt
 ```
+
+## Version History
+
+| Version | Branch | Description |
+|---------|--------|-------------|
+| V1 | `main` | Runtime A (Sonnet, generates code) + Runtime B (no LLM, exec only) |
+| V2 | `v3-design` | Design doc only — single Runtime with sub-agents |
+| **V3** | **`v3-design`** | **Runtime A (Opus, sole brain) + Runtime B (shell + python + Opus report SSE)** |
+| V4 | `v4-java-research` | Research: Java + LangGraph feasibility |
