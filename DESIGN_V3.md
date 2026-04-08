@@ -236,10 +236,6 @@ tenants/acme-corp/reports/
 └── q1_product_detail.csv                   ← Agent A 指挥 Runtime B 生成
 ```
 
-### Local E2E Test (also verified)
-
-Same pipeline verified locally (Runtime B on :8081, Runtime A on :8080).
-
 ### Deployment Pitfalls (fixed)
 
 | 问题 | 原因 | 修复 |
@@ -247,7 +243,7 @@ Same pipeline verified locally (Runtime B on :8081, Runtime A on :8080).
 | `runtimeSessionId` validation error | 最少 33 字符，短 UUID 不够 | 改用完整 UUID `str(uuid.uuid4())` |
 | `contextvars` 在 tool 线程中丢失 | Strands Agent 在线程池执行 tool，ContextVar 不传播 | 改用模块级变量（单请求 microVM 安全） |
 | `converse_stream` model ID invalid | 需要 inference profile ID，不是直接 model ID | 使用 `us.anthropic.claude-opus-4-6-v1` |
-| Runtime B 502 | 监听 8081 而非 AgentCore 默认 8080 | 修正端口 |
+| Runtime B 502 | 未监听 AgentCore 默认端口 8080 | 修正端口为 8080 |
 | CodeBuild Docker Hub 429 | 限流 | 改用 `public.ecr.aws` 基础镜像 |
 | AWS_REGION 被覆盖 | 环境变量 `AWS_DEFAULT_REGION` 优先级 | 部署时显式设置 `AWS_REGION` |
 
@@ -272,7 +268,6 @@ Same pipeline verified locally (Runtime B on :8081, Runtime A on :8080).
 ```
 .
 ├── DESIGN_V3.md                    # This file
-├── main_v3.py                      # Runtime A V3 source
 ├── runtime_a_v3/
 │   ├── main.py                     # Runtime A: Agent A (brain) + tool loop + SSE forwarding
 │   ├── Dockerfile

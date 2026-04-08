@@ -33,6 +33,8 @@ RUNTIME_B_ARN = os.environ.get("RUNTIME_B_ARN", "")
 
 if not BUCKET:
     raise RuntimeError("DATA_BUCKET environment variable is required")
+if not RUNTIME_B_ARN:
+    raise RuntimeError("RUNTIME_B_ARN environment variable is required")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)-7s | %(message)s", datefmt="%H:%M:%S")
 logger = logging.getLogger(__name__)
@@ -55,12 +57,9 @@ def get_session_id() -> str:
 # ---------- Runtime B Invocation ----------
 
 def invoke_runtime_b(action: str, payload_extra: dict) -> dict:
-    """Invoke Runtime B with an action. Returns parsed JSON response."""
+    """Invoke Runtime B with an action via invoke_agent_runtime. Returns parsed JSON."""
     session_id = get_session_id()
     payload = {"action": action, **payload_extra}
-
-    if not RUNTIME_B_ARN:
-        return _invoke_local(payload)
 
     response = agentcore_dp.invoke_agent_runtime(
         agentRuntimeArn=RUNTIME_B_ARN,
@@ -73,28 +72,14 @@ def invoke_runtime_b(action: str, payload_extra: dict) -> dict:
     return json.loads(body)
 
 
-def _invoke_local(payload: dict) -> dict:
-    """Local dev: call Runtime B via HTTP."""
-    import urllib.request
-    url = os.environ.get("RUNTIME_B_URL", "http://localhost:8081/invocations")
-    data = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=120) as resp:
-        return json.loads(resp.read().decode("utf-8"))
-
-
 def invoke_runtime_b_report_stream(context: str, s3_output_prefix: str):
-    """Invoke Runtime B report action and yield SSE events."""
+    """Invoke Runtime B report action via invoke_agent_runtime and yield SSE events."""
     session_id = get_session_id()
     payload = json.dumps({
         "action": "report",
         "context": context,
         "s3_output_prefix": s3_output_prefix,
     }).encode("utf-8")
-
-    if not RUNTIME_B_ARN:
-        yield from _invoke_local_stream(payload)
-        return
 
     response = agentcore_dp.invoke_agent_runtime(
         agentRuntimeArn=RUNTIME_B_ARN,
@@ -112,22 +97,6 @@ def invoke_runtime_b_report_stream(context: str, s3_output_prefix: str):
                     yield json.loads(line_str[6:])
                 except json.JSONDecodeError:
                     yield {"type": "raw", "content": line_str[6:]}
-
-
-def _invoke_local_stream(payload: bytes):
-    """Local dev: stream from Runtime B via HTTP."""
-    import urllib.request
-    url = os.environ.get("RUNTIME_B_URL", "http://localhost:8081/invocations")
-    req = urllib.request.Request(url, data=payload,
-                                headers={"Content-Type": "application/json", "Accept": "text/event-stream"})
-    with urllib.request.urlopen(req, timeout=600) as resp:
-        for raw_line in resp:
-            line = raw_line.decode("utf-8").strip()
-            if line.startswith("data: "):
-                try:
-                    yield json.loads(line[6:])
-                except json.JSONDecodeError:
-                    yield {"type": "raw", "content": line[6:]}
 
 
 # ---------- Agent Tools (remote control Runtime B) ----------
