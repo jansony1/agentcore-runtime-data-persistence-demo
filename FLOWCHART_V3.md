@@ -107,7 +107,9 @@
 └──────────────────────────────────────────────────────────────────────┘
 ```
 
-## Key Code: Runtime A (手写 tool loop，全程流式)
+## Key Code: Runtime A — Alternative (手写 tool loop，全程流式)
+
+> **Note**: 以下为备选方案，未在当前实现中使用。当前实现使用 Strands Agent 的 `agent(task)` 阻塞调用（Phase 1 无中间状态推送）。此方案通过手写 Bedrock Converse tool loop 替代 Strands Agent，实现 Phase 1 全程流式。如需改进 Phase 1 用户体验可切换到此方案。
 
 ```python
 @app.entrypoint
