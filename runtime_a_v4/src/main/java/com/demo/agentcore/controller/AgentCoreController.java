@@ -6,7 +6,7 @@ import dev.langchain4j.data.message.ChatMessage;
 import dev.langchain4j.data.message.SystemMessage;
 import dev.langchain4j.data.message.UserMessage;
 import dev.langchain4j.model.bedrock.BedrockChatModel;
-import org.bsc.langgraph4j.RunnableConfig;
+import dev.langchain4j.model.bedrock.BedrockStreamingChatModel;
 import org.bsc.langgraph4j.agentexecutor.AgentExecutor;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -25,9 +25,10 @@ import java.util.*;
 import java.util.concurrent.CompletableFuture;
 
 /**
- * AgentCore HTTP protocol implementation.
- * POST /invocations → main handler (SSE streaming)
- * GET /ping → health check
+ * AgentCore HTTP protocol: POST /invocations (SSE) + GET /ping.
+ *
+ * Uses LangGraph4j AgentExecutor (ReACT pattern) with BedrockStreamingChatModel
+ * for Phase 1 streaming, and forwards Runtime B report SSE for Phase 2.
  */
 @RestController
 public class AgentCoreController {
@@ -37,18 +38,13 @@ public class AgentCoreController {
 
     private final BedrockAgentCoreClient agentCoreClient;
     private final BedrockChatModel chatModel;
+    private final BedrockStreamingChatModel streamingChatModel;
 
     @Value("${app.runtime-b-arn}")
     private String runtimeBArn;
 
     @Value("${app.data-bucket}")
     private String dataBucket;
-
-    @Value("${app.aws-region}")
-    private String awsRegion;
-
-    @Value("${app.model-id}")
-    private String modelId;
 
     private static final String SYSTEM_PROMPT = """
             你是一个数据分析 Agent，你是唯一的决策者。
@@ -76,9 +72,12 @@ public class AgentCoreController {
             - 你负责数据准备和计算，最终的深度分析和报告将由下游完成
             """;
 
-    public AgentCoreController(BedrockAgentCoreClient agentCoreClient, BedrockChatModel chatModel) {
+    public AgentCoreController(BedrockAgentCoreClient agentCoreClient,
+                               BedrockChatModel chatModel,
+                               BedrockStreamingChatModel streamingChatModel) {
         this.agentCoreClient = agentCoreClient;
         this.chatModel = chatModel;
+        this.streamingChatModel = streamingChatModel;
     }
 
     @GetMapping("/ping")
@@ -91,7 +90,7 @@ public class AgentCoreController {
                              @RequestHeader(value = "X-Amzn-Bedrock-AgentCore-Runtime-Session-Id",
                                      required = false) String headerSessionId) {
 
-        SseEmitter emitter = new SseEmitter(600_000L); // 10 min timeout
+        SseEmitter emitter = new SseEmitter(600_000L);
 
         String tenantId = (String) payload.getOrDefault("tenant_id", "default");
         String sessionId = headerSessionId != null ? headerSessionId : UUID.randomUUID().toString();
@@ -106,15 +105,16 @@ public class AgentCoreController {
                 String s3Prefix = "tenants/" + tenantId + "/datasets/";
                 String s3OutputPrefix = "tenants/" + tenantId + "/reports/";
 
-                // === Phase 1: LangGraph4j Agent with tool loop ===
-                sendEvent(emitter, Map.of("type", "status", "stage", "analysis", "message", "Agent 开始分析..."));
+                // === Phase 1: LangGraph4j AgentExecutor with streaming ===
+                sendEvent(emitter, Map.of("type", "status", "stage", "analysis",
+                        "message", "Agent 开始分析..."));
 
                 RuntimeBTools tools = new RuntimeBTools(agentCoreClient, runtimeBArn, sessionId);
 
-                // Build LangGraph4j AgentExecutor (ReACT agent with tool loop)
+                // Build graph with StreamingChatModel for Phase 1 streaming
                 var graph = AgentExecutor.builder()
-                        .chatModel(chatModel)
-                        .systemMessage(SystemMessage.from(SYSTEM_PROMPT.replace("${BUCKET}", dataBucket)))
+                        .chatModel(streamingChatModel)
+                        .systemMessage(SystemMessage.from(SYSTEM_PROMPT))
                         .toolsFromObject(tools)
                         .build()
                         .compile();
@@ -123,41 +123,41 @@ public class AgentCoreController {
                         "租户数据在 S3: s3://%s/%s\n请下载数据并完成以下分析任务: %s\n输出文件保存到 /tmp/workspace/output/",
                         dataBucket, s3Prefix, message);
 
-                // Stream graph execution — each node output is visible
                 var inputs = Map.<String, Object>of("messages", List.of(UserMessage.from(userPrompt)));
-                String analysisResult = "";
 
+                // graph.stream() yields NodeOutput at each step (agent think, tool exec)
+                String lastNodeName = "";
                 for (var output : graph.stream(inputs)) {
                     String nodeName = output.node();
-                    if ("agent".equals(nodeName)) {
+                    if (!nodeName.equals(lastNodeName)) {
+                        String statusMsg = switch (nodeName) {
+                            case "agent" -> "Agent 思考中...";
+                            case "tools", "action" -> "正在执行工具...";
+                            default -> "节点: " + nodeName;
+                        };
                         sendEvent(emitter, Map.of("type", "status", "stage", "analysis",
-                                "message", "Agent 思考中..."));
-                    } else if ("tools".equals(nodeName) || "action".equals(nodeName)) {
-                        sendEvent(emitter, Map.of("type", "status", "stage", "analysis",
-                                "message", "正在执行工具..."));
+                                "message", statusMsg));
+                        lastNodeName = nodeName;
                     }
                 }
 
-                // Extract final response from last node output
-                // The graph.stream() iteration already consumed all outputs
-                // analysisResult is built from the messages in the final state
-                analysisResult = "数据已准备完成，请基于 workspace 中的文件进行分析和报告生成。";
-
-                log.info("Agent analysis complete: {} chars", analysisResult.length());
-                sendEvent(emitter, Map.of("type", "status", "stage", "analysis", "message", "数据准备完成"));
+                sendEvent(emitter, Map.of("type", "status", "stage", "analysis",
+                        "message", "数据准备完成"));
 
                 // === Phase 2: Report streaming from Runtime B ===
                 sendEvent(emitter, Map.of("type", "status", "stage", "report",
                         "message", "正在分析数据并生成报告..."));
 
-                streamReportFromRuntimeB(emitter, sessionId, analysisResult, s3OutputPrefix);
+                String analysisContext = "数据已准备完成，请基于 workspace 中的文件进行分析和报告生成。";
+                streamReportFromRuntimeB(emitter, sessionId, analysisContext, s3OutputPrefix);
 
                 emitter.complete();
 
             } catch (Exception e) {
                 log.error("Error: {}", e.getMessage(), e);
                 try {
-                    sendEvent(emitter, Map.of("type", "error", "message", e.getMessage()));
+                    sendEvent(emitter, Map.of("type", "error", "message",
+                            e.getMessage() != null ? e.getMessage() : e.toString()));
                     emitter.complete();
                 } catch (Exception ignored) {
                 }
@@ -192,6 +192,7 @@ public class AgentCoreController {
                 if (line.startsWith("data: ")) {
                     String eventData = line.substring(6);
                     try {
+                        @SuppressWarnings("unchecked")
                         Map<String, Object> event = mapper.readValue(eventData, Map.class);
                         sendEvent(emitter, event);
                     } catch (Exception e) {

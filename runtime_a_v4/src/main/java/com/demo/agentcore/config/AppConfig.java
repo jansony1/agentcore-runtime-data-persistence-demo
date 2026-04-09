@@ -8,6 +8,7 @@ import software.amazon.awssdk.services.bedrockagentcore.BedrockAgentCoreClient;
 import software.amazon.awssdk.services.bedrockruntime.BedrockRuntimeClient;
 
 import dev.langchain4j.model.bedrock.BedrockChatModel;
+import dev.langchain4j.model.bedrock.BedrockStreamingChatModel;
 
 @Configuration
 public class AppConfig {
@@ -35,6 +36,14 @@ public class AppConfig {
     @Bean
     public BedrockChatModel chatModel() {
         return BedrockChatModel.builder()
+                .modelId(modelId)
+                .region(Region.of(awsRegion))
+                .build();
+    }
+
+    @Bean
+    public BedrockStreamingChatModel streamingChatModel() {
+        return BedrockStreamingChatModel.builder()
                 .modelId(modelId)
                 .region(Region.of(awsRegion))
                 .build();
