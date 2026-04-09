@@ -6,7 +6,6 @@ import dev.langchain4j.data.message.ChatMessage;
 import dev.langchain4j.data.message.SystemMessage;
 import dev.langchain4j.data.message.UserMessage;
 import dev.langchain4j.model.bedrock.BedrockChatModel;
-import dev.langchain4j.model.bedrock.BedrockStreamingChatModel;
 import org.bsc.langgraph4j.CompileConfig;
 import org.bsc.langgraph4j.agentexecutor.AgentExecutor;
 import org.slf4j.Logger;
@@ -24,6 +23,7 @@ import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.util.*;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * AgentCore HTTP protocol: POST /invocations (SSE) + GET /ping.
@@ -39,7 +39,6 @@ public class AgentCoreController {
 
     private final BedrockAgentCoreClient agentCoreClient;
     private final BedrockChatModel chatModel;
-    private final BedrockStreamingChatModel streamingChatModel;
 
     @Value("${app.runtime-b-arn}")
     private String runtimeBArn;
@@ -74,11 +73,9 @@ public class AgentCoreController {
             """;
 
     public AgentCoreController(BedrockAgentCoreClient agentCoreClient,
-                               BedrockChatModel chatModel,
-                               BedrockStreamingChatModel streamingChatModel) {
+                               BedrockChatModel chatModel) {
         this.agentCoreClient = agentCoreClient;
         this.chatModel = chatModel;
-        this.streamingChatModel = streamingChatModel;
     }
 
     @GetMapping("/ping")
@@ -102,6 +99,23 @@ public class AgentCoreController {
                 message.length() > 80 ? message.substring(0, 80) + "..." : message);
 
         CompletableFuture.runAsync(() -> {
+            // Heartbeat thread: send keepalive events to prevent SSE timeout
+            AtomicBoolean agentDone = new AtomicBoolean(false);
+            Thread heartbeat = new Thread(() -> {
+                while (!agentDone.get()) {
+                    try {
+                        Thread.sleep(15_000);
+                        if (!agentDone.get()) {
+                            sendEvent(emitter, Map.of("type", "heartbeat"));
+                        }
+                    } catch (InterruptedException e) {
+                        break;
+                    }
+                }
+            });
+            heartbeat.setDaemon(true);
+            heartbeat.start();
+
             try {
                 String s3Prefix = "tenants/" + tenantId + "/datasets/";
                 String s3OutputPrefix = "tenants/" + tenantId + "/reports/";
@@ -113,8 +127,10 @@ public class AgentCoreController {
                 RuntimeBTools tools = new RuntimeBTools(agentCoreClient, runtimeBArn, sessionId);
 
                 // Build graph with StreamingChatModel for Phase 1 streaming
+                // Use sync ChatModel — graph.stream() provides node-level streaming,
+                // model-level streaming (Netty async) causes timeout issues
                 var graph = AgentExecutor.builder()
-                        .chatModel(streamingChatModel)
+                        .chatModel(chatModel)
                         .systemMessage(SystemMessage.from(SYSTEM_PROMPT))
                         .toolsFromObject(tools)
                         .build()
@@ -128,8 +144,10 @@ public class AgentCoreController {
 
                 // graph.stream() yields NodeOutput at each step (agent think, tool exec)
                 String lastNodeName = "";
+                AgentExecutor.State lastState = null;
                 for (var output : graph.stream(inputs)) {
                     String nodeName = output.node();
+                    lastState = output.state();
                     if (!nodeName.equals(lastNodeName)) {
                         String statusMsg = switch (nodeName) {
                             case "agent" -> "Agent 思考中...";
@@ -142,19 +160,43 @@ public class AgentCoreController {
                     }
                 }
 
+                // Extract agent's final analysis from graph state
+                String analysisContext = "";
+                if (lastState != null) {
+                    // Try finalResponse first
+                    analysisContext = lastState.finalResponse().orElse("");
+                    // If empty, extract text from last messages
+                    if (analysisContext.isEmpty()) {
+                        var messages = lastState.messages();
+                        if (messages != null && !messages.isEmpty()) {
+                            var lastMsg = messages.get(messages.size() - 1);
+                            if (lastMsg instanceof dev.langchain4j.data.message.AiMessage aiMsg) {
+                                analysisContext = aiMsg.text() != null ? aiMsg.text() : "";
+                            }
+                        }
+                    }
+                }
+                if (analysisContext.isEmpty()) {
+                    analysisContext = "Agent 分析完成但未产出文本结果。请基于 workspace 中的文件进行分析。";
+                }
+
+                agentDone.set(true);
+                heartbeat.interrupt();
+
+                log.info("Agent analysis complete: {} chars", analysisContext.length());
                 sendEvent(emitter, Map.of("type", "status", "stage", "analysis",
                         "message", "数据准备完成"));
 
                 // === Phase 2: Report streaming from Runtime B ===
                 sendEvent(emitter, Map.of("type", "status", "stage", "report",
                         "message", "正在分析数据并生成报告..."));
-
-                String analysisContext = "数据已准备完成，请基于 workspace 中的文件进行分析和报告生成。";
                 streamReportFromRuntimeB(emitter, sessionId, analysisContext, s3OutputPrefix);
 
                 emitter.complete();
 
             } catch (Exception e) {
+                agentDone.set(true);
+                heartbeat.interrupt();
                 log.error("Error: {}", e.getMessage(), e);
                 try {
                     sendEvent(emitter, Map.of("type", "error", "message",
