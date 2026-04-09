@@ -128,11 +128,11 @@ Runtime A entrypoint (generator → SSE):
 
 ## Key Design Decisions
 
-### 1. 为什么 Phase 1 是阻塞的？
+### 1. Phase 1 全程流式（使用 stream_async）
 
-Strands Agent 的 tool call 是同步的——每次调用 `runtime_b_shell` 或 `runtime_b_python`，必须等 Runtime B 返回结果后 Agent 才能决定下一步。无法在 tool loop 过程中 yield SSE。
+使用 Strands Agent 的 `agent.stream_async(task)` 替代 `agent(task)` 阻塞调用。`stream_async` 是 async generator，在 agent tool loop 的每一步都会 yield 事件（tool_use_stream、text chunk 等），entrypoint 将这些事件转换为 SSE 推送给前端。
 
-这意味着 Phase 1 期间前端只看到 "Agent 开始分析..." 状态。分析完成后才进入 Phase 2 的流式报告。
+Phase 1 和 Phase 2 都是流式的，前端全程无黑盒。
 
 ### 2. 为什么报告要在 Runtime B 渲染而不是 Runtime A？
 
@@ -150,13 +150,16 @@ invoke_agent_runtime(session=X, action=report) → reads all outputs, streams re
 
 同 session = 同 microVM = 文件系统持久。
 
-### 4. Phase 1 能否也推中间状态？
+### 4. stream_async vs agent(task)
 
-目前不行（Agent tool call 是同步的）。如果需要，可以：
-- 用 `threading` + `queue`：Agent 在后台线程跑，tool 调用时往 queue 推状态，主线程从 queue yield
-- 用 Strands 的 `callback_handler`：捕获 tool_use 事件推送
+| | `agent(task)` | `agent.stream_async(task)` |
+|---|---|---|
+| 返回方式 | 阻塞，等全部完成 | async generator，逐步 yield 事件 |
+| Phase 1 可见性 | 黑盒 | **每个 tool call 实时推送** |
+| 内部 agent loop | 相同 | 相同 |
+| 框架能力保留 | 是 | 是（tool 定义、模型抽象、重试等不变） |
 
-这是 future improvement，不影响核心流程。
+关键认知：`agent(task)` 和 `stream_async` 执行的 agent loop 完全一样，区别只在于你是等比赛结束看比分，还是看直播。
 
 ---
 
@@ -189,51 +192,48 @@ resp = client.invoke_agent_runtime(
 )
 ```
 
-**SSE Output (actual):**
+**SSE Output (actual, stream_async — Phase 1 每步可见):**
 ```
 [analysis] Agent 开始分析...
-           Phase 1: Agent A (Opus 4.6) 多次 invoke_agent_runtime(Runtime B):
-             → shell("aws s3 cp ...") → 下载数据
-             → shell("head ...") → 预览结构
-             → python("import pandas ...") → 分析计算
-             → python("import matplotlib ...") → 生成图表
-           全部决策在 Agent A，Runtime B 只执行返回结果
-[analysis] 数据分析完成
-[report]   正在生成分析报告...
+[analysis] 正在执行: runtime_b_shell           ← Phase 1 实时推送
+[analysis] 正在执行: runtime_b_python          ← Phase 1 实时推送
+[analysis] 正在执行: runtime_b_shell           ← Phase 1 实时推送
+[analysis] 正在执行: runtime_b_python          ← Phase 1 实时推送
+[analysis] 正在执行: runtime_b_shell           ← Phase 1 实时推送
+[analysis] 正在执行: runtime_b_python          ← Phase 1 实时推送
+[analysis] 正在执行: runtime_b_shell           ← Phase 1 实时推送
+[analysis] 数据准备完成
+[report]   正在分析数据并生成报告...
 [report]   正在生成分析报告 (Opus 4.6 streaming)...
-[chunk]    # ACME Corp 2026 Q1 各区域销售达成率分析报告 ...
+[chunk]    # 📊 各区域 Q1 销售达成率分析报告 ...   ← Phase 2 逐 token
 [chunk]    ## 一、概述 ...
 [chunk]    ## 二、关键发现 ...
-           (943 chunks, 3657 chars 流式输出)
-[done]     5 files → S3
+           (806 chunks, 3358 chars 流式输出)
+[done]     3 files → S3
 ```
 
-**Report Preview (deployed output):**
+**Report Preview (deployed output, Runtime B Opus 4.6 分析+生成):**
 ```markdown
-# ACME Corp 2026 Q1 各区域销售达成率分析报告
+# 📊 各区域 Q1 销售达成率分析报告
 
 ## 一、概述
-2026年第一季度，公司整体销售表现严重低于预期。全公司Q1实际销售收入为
-¥919.5万，仅完成 ¥1,850万 年度Q1目标的 49.70%，总销售缺口高达 ¥930 万。
+本报告基于 2026 年第一季度各区域销售交易数据与目标数据，对全国 5 大区域
+的销售达成情况进行全面分析。
+
+核心结论：Q1 全国整体达成率仅为 49.7%，所有区域均未完成季度目标。
 
 ## 二、关键发现
-| 排名 | 区域 | 达成率 | 实际销售 | 季度目标 | 缺口金额 |
-|:---:|:---:|:---:|---:|---:|---:|
-| 1 | 华中 | 64.42% | ¥193万 | ¥300万 | -¥107万 |
-| 2 | 西南 | 56.00% | ¥112万 | ¥200万 | -¥88万 |
-| 3 | 华南 | 53.40% | ¥214万 | ¥400万 | -¥186万 |
-| 4 | 华北 | 47.90% | ¥216万 | ¥450万 | -¥234万 |
-| 5 | 华东 | 37.00% | ¥185万 | ¥500万 | -¥315万 |
+1. 全军未达标：5 个区域无一完成 Q1 销售目标
+2. 华中领跑全国：华中区域以 64.42% 的达成率位居首位
+3. 华东垫底堪忧：华东区域达成率仅 37.01%，缺口最大（约 315 万）
 ```
 
 **S3 Persisted Output:**
 ```
 tenants/acme-corp/reports/
-├── analysis_report.md                      ← Opus 4.6 流式生成的深度报告
-├── q1_region_achievement_summary.csv       ← Agent A 指挥 Runtime B 生成
-├── q1_sales_achievement_analysis.png       ← Agent A 指挥 Runtime B 生成
-├── q1_monthly_detail.csv                   ← Agent A 指挥 Runtime B 生成
-└── q1_product_detail.csv                   ← Agent A 指挥 Runtime B 生成
+├── analysis_report.md                      ← Runtime B Opus 4.6 分析+生成的深度报告
+├── q1_region_achievement.csv               ← Agent A 指挥 Runtime B 计算
+└── q1_region_achievement_chart.png         ← Agent A 指挥 Runtime B 生成
 ```
 
 ### Deployment Pitfalls (fixed)
@@ -254,11 +254,13 @@ tenants/acme-corp/reports/
 | | V1 | V2 | V3 (final) |
 |---|---|---|---|
 | 大脑在哪 | Runtime A | 同进程 | **Runtime A (唯一)** |
-| Runtime B 角色 | 无 LLM 执行器 | N/A | **无决策执行器 + 报告渲染器** |
-| Agent A 怎么控制 B | 一次性传代码 | 直接 exec | **多次 tool call 遥控** |
+| Runtime B 角色 | 无 LLM 执行器 | N/A | **执行器 + LLM 分析报告** |
+| Runtime B 的 LLM | 无 | N/A | **Opus 4.6（分析数据+生成报告）** |
+| Agent A 怎么控制 B | 一次性传代码 | 直接 exec | **多次 tool call 遥控 (stream_async)** |
 | 代码修复 | 跨 Runtime 来回 | 本地 | **Agent A 决定修复 → 再调 B** |
-| 报告生成 | Agent A 自己 | 同进程 | **Agent A 指挥 → Runtime B 渲染 → SSE** |
-| 流式体验 | 无 | 无 | **Phase 2 报告逐 token 推送** |
+| 报告生成 | Agent A 自己 | 同进程 | **Runtime B 读 workspace 文件 → Opus 分析+报告** |
+| Phase 1 流式 | 无 | 无 | **stream_async: 每个 tool call 实时推送** |
+| Phase 2 流式 | 无 | 无 | **converse_stream: 报告逐 token 推送** |
 | B 的文件状态 | 每次调用独立 | N/A | **同 session 持久** |
 
 ---
@@ -283,11 +285,10 @@ tenants/acme-corp/reports/
 
 ## Open Questions
 
-1. **Phase 1 中间状态推送**：Agent tool loop 过程中的 shell/python 结果能否实时推给前端？
-   - 可选方案：threading + queue，或 Strands callback_handler
+1. ~~**Phase 1 中间状态推送**~~ → **已解决**：使用 `agent.stream_async()` 实现全程流式
 2. **Session 超时**：Agent A 分析耗时较长时，Runtime B 的 session 可能因 idle timeout 被回收
    - 建议：设置 `idle_runtime_session_timeout` 为较长值（如 1800s）
-3. **Agent A 的模型选择**：当前用 Opus 4.6 做分析决策，成本较高
-   - 可选：分析用 Sonnet，只在报告渲染时用 Opus
+3. **Agent A 的模型选择**：当前 Agent A 用 Opus 4.6 做数据准备决策，可优化为 Sonnet（更快更便宜）
+   - Opus 只在 Runtime B 的 report action 中使用（真正需要强推理的分析+报告）
 4. **多工作站扩展**：未来加 Web 研究、文档生成等能力
    - Agent A 加新 tools（runtime_c_browse, runtime_d_docgen），每个指向不同 Runtime
