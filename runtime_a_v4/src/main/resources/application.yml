@@ -1,0 +1,15 @@
+server:
+  port: ${PORT:8080}
+
+app:
+  aws-region: ${AWS_REGION:us-east-1}
+  data-bucket: ${DATA_BUCKET:}
+  runtime-b-arn: ${RUNTIME_B_ARN:}
+  model-id: ${MODEL_ID:us.anthropic.claude-opus-4-6-v1}
+  opus-model-id: ${OPUS_MODEL_ID:us.anthropic.claude-opus-4-6-v1}
+
+logging:
+  level:
+    com.demo.agentcore: INFO
+  pattern:
+    console: "%d{HH:mm:ss} | %-7level | %msg%n"
