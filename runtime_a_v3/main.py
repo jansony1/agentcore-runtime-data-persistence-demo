@@ -1,23 +1,21 @@
 """
-Runtime A V3 — Agent A (The Only Brain)
+Runtime A V3 — Agent A (The Only Brain) with Full SSE Streaming
 
-Agent A is the sole decision-maker. It controls Runtime B through tools:
-  - runtime_b_shell: execute shell commands on Runtime B
-  - runtime_b_python: execute Python code on Runtime B
-
-After Agent A completes analysis, the entrypoint invokes Runtime B's
-report action and forwards the SSE stream to the frontend.
+Agent A controls Runtime B through tools (shell, python).
+Uses Strands agent.stream_async() to yield events during the tool loop,
+so every tool call and LLM thinking step is visible to the frontend.
 
 Flow:
-  Phase 1 (blocking): Agent A tool loop → shell/python on Runtime B
+  Phase 1 (streaming): Agent A stream_async → yield tool call/result/thinking events
   Phase 2 (streaming): Forward Runtime B report SSE → frontend
+  = Full SSE end-to-end, zero black box
 """
 
 import os
 import json
 import logging
 import uuid
-from typing import Optional
+import asyncio
 
 import boto3
 from botocore.config import Config
@@ -31,10 +29,12 @@ BUCKET = os.environ.get("DATA_BUCKET", "")
 MODEL_ID = os.environ.get("MODEL_ID", "us.anthropic.claude-opus-4-6-v1")
 RUNTIME_B_ARN = os.environ.get("RUNTIME_B_ARN", "")
 
+RUNTIME_B_URL = os.environ.get("RUNTIME_B_URL", "")  # Local dev fallback
+
 if not BUCKET:
     raise RuntimeError("DATA_BUCKET environment variable is required")
-if not RUNTIME_B_ARN:
-    raise RuntimeError("RUNTIME_B_ARN environment variable is required")
+if not RUNTIME_B_ARN and not RUNTIME_B_URL:
+    raise RuntimeError("RUNTIME_B_ARN or RUNTIME_B_URL environment variable is required")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)-7s | %(message)s", datefmt="%H:%M:%S")
 logger = logging.getLogger(__name__)
@@ -57,13 +57,20 @@ def get_session_id() -> str:
 # ---------- Runtime B Invocation ----------
 
 def invoke_runtime_b(action: str, payload_extra: dict) -> dict:
-    """Invoke Runtime B with an action via invoke_agent_runtime. Returns parsed JSON."""
+    """Invoke Runtime B with an action. Returns parsed JSON."""
     session_id = get_session_id()
     payload = {"action": action, **payload_extra}
+    data = json.dumps(payload).encode("utf-8")
+
+    if RUNTIME_B_URL:
+        import urllib.request
+        req = urllib.request.Request(RUNTIME_B_URL, data=data, headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            return json.loads(resp.read().decode("utf-8"))
 
     response = agentcore_dp.invoke_agent_runtime(
         agentRuntimeArn=RUNTIME_B_ARN,
-        payload=json.dumps(payload).encode("utf-8"),
+        payload=data,
         contentType="application/json",
         runtimeSessionId=session_id,
         qualifier="DEFAULT",
@@ -73,13 +80,27 @@ def invoke_runtime_b(action: str, payload_extra: dict) -> dict:
 
 
 def invoke_runtime_b_report_stream(context: str, s3_output_prefix: str):
-    """Invoke Runtime B report action via invoke_agent_runtime and yield SSE events."""
+    """Invoke Runtime B report action and yield SSE events."""
     session_id = get_session_id()
     payload = json.dumps({
         "action": "report",
         "context": context,
         "s3_output_prefix": s3_output_prefix,
     }).encode("utf-8")
+
+    if RUNTIME_B_URL:
+        import urllib.request
+        req = urllib.request.Request(RUNTIME_B_URL, data=payload,
+                                    headers={"Content-Type": "application/json", "Accept": "text/event-stream"})
+        with urllib.request.urlopen(req, timeout=600) as resp:
+            for raw_line in resp:
+                line = raw_line.decode("utf-8").strip()
+                if line.startswith("data: "):
+                    try:
+                        yield json.loads(line[6:])
+                    except json.JSONDecodeError:
+                        yield {"type": "raw", "content": line[6:]}
+        return
 
     response = agentcore_dp.invoke_agent_runtime(
         agentRuntimeArn=RUNTIME_B_ARN,
@@ -157,16 +178,15 @@ SYSTEM_PROMPT = f"""你是一个数据分析 Agent，你是唯一的决策者。
 ## 工作流程
 1. 用 runtime_b_shell 从 S3 下载数据到工作站
 2. 用 runtime_b_shell 预览数据结构 (head, wc 等)
-3. 用 runtime_b_python 执行 pandas 分析
+3. 用 runtime_b_python 执行 pandas 数据处理和计算
 4. 如果代码报错，阅读 stderr，修正代码，重试（最多 3 次）
 5. 用 runtime_b_python 生成 matplotlib 图表，保存到 /tmp/workspace/output/
-6. 用 print() 输出所有关键发现（数字、排名、结论），这些会被用于生成最终报告
+6. 将处理后的数据（CSV）保存到 /tmp/workspace/output/
 
 ## 重要规则
 - 数据桶: s3://{BUCKET}/
-- 总是 print() 关键分析结论和数据表格
 - 图表和 CSV 保存到 /tmp/workspace/output/
-- 你的输出会被传给报告生成器，所以要尽可能详细和有数据支撑
+- 你负责数据准备和计算，最终的深度分析和报告将由下游 LLM 基于你产出的数据文件完成
 """
 
 
@@ -185,8 +205,8 @@ def resolve_tenant_id(payload: dict, context: RequestContext) -> str:
 # ---------- Entrypoint ----------
 
 @app.entrypoint
-def invoke(payload: dict, context: RequestContext):
-    """Generator → SSE. Phase 1: Agent analysis. Phase 2: Report streaming."""
+async def invoke(payload: dict, context: RequestContext):
+    """Async generator → SSE. Full streaming via agent.stream_async()."""
     tenant_id = resolve_tenant_id(payload, context)
     session_id = context.session_id or payload.get("session_id", str(uuid.uuid4()))
     message = payload.get("message", "")
@@ -203,36 +223,82 @@ def invoke(payload: dict, context: RequestContext):
 
     logger.info(f"Tenant: {tenant_id} | Session: {session_id} | Query: {message[:80]}")
 
-    # === Phase 1: Agent-driven analysis (blocking) ===
+    # === Phase 1: Agent stream_async (every step visible) ===
+
     yield {"type": "status", "stage": "analysis", "message": "Agent 开始分析..."}
 
     agent = Agent(
-        model=BedrockModel(model_id=MODEL_ID, streaming=False),
+        model=BedrockModel(model_id=MODEL_ID, streaming=True),
         tools=[runtime_b_shell, runtime_b_python],
         system_prompt=SYSTEM_PROMPT,
     )
 
+    analysis_result = ""
+    current_tool_name = None
+
     try:
-        analysis_result = str(agent(
+        async for event in agent.stream_async(
             f"租户数据在 S3: s3://{BUCKET}/{s3_prefix}\n"
             f"请下载数据并完成以下分析任务: {message}\n"
             f"输出文件保存到 /tmp/workspace/output/"
-        ))
+        ):
+            if not isinstance(event, dict):
+                continue
+
+            event_type = event.get("type", "")
+
+            # Tool call starting
+            if event_type == "tool_use_stream":
+                tool_info = event.get("current_tool_use", {})
+                tool_name = tool_info.get("name", "")
+                if tool_name and tool_name != current_tool_name:
+                    current_tool_name = tool_name
+                    yield {"type": "status", "stage": "analysis",
+                           "message": f"正在执行: {tool_name}"}
+
+            # Tool result returned
+            elif event_type == "tool_result":
+                tr = event.get("tool_result", {})
+                status = tr.get("status", "unknown")
+                yield {"type": "status", "stage": "analysis",
+                       "message": f"{current_tool_name} 完成 (status={status})"}
+                current_tool_name = None
+
+            # LLM text output (thinking / final answer)
+            elif "data" in event and event.get("data"):
+                text = str(event["data"])
+                analysis_result += text
+
+            # Final result
+            elif "result" in event:
+                result_obj = event.get("result")
+                if result_obj and hasattr(result_obj, "message"):
+                    # Extract final text from result message
+                    msg = result_obj.message
+                    if hasattr(msg, "content"):
+                        for block in msg.content:
+                            if hasattr(block, "text"):
+                                analysis_result = block.text
+
         logger.info(f"Agent analysis complete: {len(analysis_result)} chars")
+
     except Exception as e:
         logger.error(f"Agent error: {e}", exc_info=True)
         yield {"type": "error", "stage": "analysis", "message": str(e)}
         return
 
-    yield {"type": "status", "stage": "analysis", "message": "数据分析完成"}
+    yield {"type": "status", "stage": "analysis", "message": "数据准备完成"}
 
-    # === Phase 2: Report streaming (forward SSE from Runtime B) ===
-    yield {"type": "status", "stage": "report", "message": "正在生成分析报告..."}
+    # === Phase 2: Report streaming (Runtime B analyzes data + generates report) ===
 
-    yield from invoke_runtime_b_report_stream(
+    yield {"type": "status", "stage": "report", "message": "正在分析数据并生成报告..."}
+
+    # invoke_runtime_b_report_stream is sync generator, wrap for async
+    for event in invoke_runtime_b_report_stream(
         context=analysis_result,
         s3_output_prefix=s3_output_prefix,
-    )
+    ):
+        yield event
 
 
 if __name__ == "__main__":
