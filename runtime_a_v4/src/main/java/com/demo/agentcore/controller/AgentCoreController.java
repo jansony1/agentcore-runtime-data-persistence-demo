@@ -7,6 +7,7 @@ import dev.langchain4j.data.message.SystemMessage;
 import dev.langchain4j.data.message.UserMessage;
 import dev.langchain4j.model.bedrock.BedrockChatModel;
 import dev.langchain4j.model.bedrock.BedrockStreamingChatModel;
+import org.bsc.langgraph4j.CompileConfig;
 import org.bsc.langgraph4j.agentexecutor.AgentExecutor;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -117,7 +118,7 @@ public class AgentCoreController {
                         .systemMessage(SystemMessage.from(SYSTEM_PROMPT))
                         .toolsFromObject(tools)
                         .build()
-                        .compile();
+                        .compile(CompileConfig.builder().recursionLimit(100).build());
 
                 String userPrompt = String.format(
                         "租户数据在 S3: s3://%s/%s\n请下载数据并完成以下分析任务: %s\n输出文件保存到 /tmp/workspace/output/",
