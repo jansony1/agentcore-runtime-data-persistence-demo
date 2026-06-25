@@ -168,3 +168,4 @@ Files: ['s3://.../analysis_report.md', 's3://.../q1_region_achievement.csv', ...
 | V2 | `v3-design` | Design doc only — single Runtime with sub-agents |
 | **V3** | **`v3-design`** | **Runtime A (Opus, sole brain) + Runtime B (shell + python + Opus report SSE)** |
 | V4 | `v4-java-research` | Research: Java + LangGraph feasibility |
+| **V5** | — | **Runtime B → Lambda MicroVM (shell/python only); report rendering moved into Runtime A. See [DESIGN_V5.md](DESIGN_V5.md)** |
