@@ -11,33 +11,28 @@ final report itself.
 
 ## Architecture
 
-```
-   Frontend ──invoke (SSE: status / chunk / done)──┐
-                                                    ▼
- ┌────────────────────────────────────────────────────────────┐
- │ Runtime A  ·  AgentCore  ·  Agent A (Opus 4.6) = sole brain  │
- │                                                              │
- │  ① run / terminate the MicroVM                              │
- │  ② Phase 1 — drive Runtime B (stream_async)                 │
- │  ③ Phase 2 — render report itself, upload to S3             │
- └───┬──────────────────┬───────────────────────┬──────────────┘
-     │ boto3            │ HTTPS + token         │ Bedrock
-     │ lambda-microvms  │ shell / python        │ converse_stream
-     ▼                  ▼                       ▼
- ┌──────────┐   ┌─────────────────────┐   ┌──────────────┐
- │ MicroVM  │   │ Runtime B           │   │   Bedrock    │
- │ control  │   │ Lambda MicroVM      │   │  (Opus 4.6)  │
- │ plane    │   │ pure executor       │   └──────────────┘
- │          │   │                     │
- │ Run /    │   │ :8080  shell → JSON │         ┌──────────────┐
- │ Get /    │   │        python→ JSON │ ──aws──▶ │  S3          │
- │ Token /  │   │ :9000  lifecycle    │   cli   │ tenants/{id}/│
- │ Terminate│   │ /tmp/workspace disk │ ◀────── │              │
- └──────────┘   └─────────────────────┘         └──────────────┘
-                pre-baked image: python +              ▲
-                pandas/numpy/matplotlib + aws cli       │ Runtime A
-                + CJK fonts (no install at runtime)     │ uploads report.md
-                                                        └──────────────
+```mermaid
+flowchart TB
+    FE["Frontend / caller"]
+
+    subgraph RA["Runtime A · AgentCore — Agent A (Opus 4.6) = sole brain"]
+        direction TB
+        L["① MicroVM lifecycle: run / terminate"]
+        P1["② Phase 1: drive Runtime B (shell / python)"]
+        P2["③ Phase 2: render report + upload"]
+    end
+
+    CP["MicroVM control plane<br/>(Lambda MicroVMs API)<br/>Run · Get · AuthToken · Terminate"]
+    RB["Runtime B · Lambda MicroVM<br/>pure executor<br/>:8080 shell / python → JSON<br/>:9000 lifecycle hooks<br/>/tmp/workspace disk<br/><br/>pre-baked image: python +<br/>pandas/numpy/matplotlib + aws cli + CJK fonts"]
+    BR["Bedrock<br/>(Opus 4.6)"]
+    S3[("S3<br/>tenants/{id}/datasets<br/>tenants/{id}/reports")]
+
+    FE -->|"invoke_agent_runtime · SSE: status/chunk/done"| RA
+    RA -->|"boto3 lambda-microvms (start/stop VM)"| CP
+    RA -->|"HTTPS + X-aws-proxy-auth (shell/python)"| RB
+    RA -->|"converse_stream (Phase 2 report)"| BR
+    RB <-->|"aws cli: download inputs / upload csv+png"| S3
+    RA -->|"put_object analysis_report.md"| S3
 ```
 
 **SSE end-to-end**: Phase 1 streams every tool call as it happens; Phase 2
