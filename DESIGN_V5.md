@@ -25,54 +25,100 @@ Runtime B is a pure executor) — but makes two structural changes:
 
 ---
 
-## Architecture
+## Architecture — components
+
+Five actors. Solid arrows = who calls whom; each is labelled with the protocol.
 
 ```
-┌─── Runtime A（AgentCore；Agent A = 唯一大脑）──────────────────────────┐
-│                                                                        │
-│  @app.entrypoint (async generator → SSE):                              │
-│    1. run_microvm  → poll RUNNING → create_microvm_auth_token          │
-│    2. Phase 1: Agent A (Opus) stream_async                             │
-│         tools: runtime_b_shell / runtime_b_python                      │
-│         → HTTPS POST to MicroVM endpoint (X-aws-proxy-auth)            │
-│    3. Phase 2: Runtime A converse_stream(Opus) → report SSE chunks     │
-│         → upload analysis_report.md to S3                              │
-│    4. finally: terminate_microvm                                       │
-│                                                                        │
-└──────────┬─────────────────────────────────────────────────────────────┘
-           │ HTTPS (per request: one MicroVM, started then terminated)
-           ▼
-┌─── Runtime B（Lambda MicroVM；纯执行器，无决策）─────────────────────┐
-│                                                                        │
-│  HTTP server :8080  →  POST {action: shell|python}  →  JSON response   │
-│    shell:  subprocess.run(command)  (aws cli preinstalled)            │
-│    python: exec(code)               (pandas/numpy/matplotlib)         │
-│                                                                        │
-│  Hook server :9000  →  /ready /run /resume /suspend /terminate         │
-│    /ready : signal snapshot-ready during image build                  │
-│    /run   : reset /tmp/workspace for a clean per-MicroVM slate         │
-│                                                                        │
-│  文件系统: /tmp/workspace/ (同一 MicroVM 内跨 shell/python 调用持久)   │
-│                                                                        │
-└────────────────────────────────────────────────────────────────────────┘
+                          ┌───────────────┐
+                          │   Frontend    │
+                          └───────┬───────┘
+                                  │  invoke_agent_runtime (SSE: status/chunk/done)
+                                  ▼
+   ┌──────────────────────────────────────────────────────────┐
+   │  Runtime A  —  AgentCore                                   │
+   │  Agent A (Opus 4.6) = the only brain                       │
+   │                                                            │
+   │   • manages the MicroVM lifecycle (run / terminate)        │
+   │   • Phase 1: drives Runtime B via 2 tools                  │
+   │   • Phase 2: renders the report itself, uploads it         │
+   └───┬───────────────┬──────────────────────┬────────────────┘
+       │               │                      │
+       │ control-plane │ data-plane           │ Bedrock
+       │ boto3         │ HTTPS + token        │ converse_stream
+       │ lambda-       │ runtime_b_shell      │ (Phase 2 report)
+       │ microvms      │ runtime_b_python     │
+       ▼               ▼                      ▼
+ ┌───────────┐   ┌──────────────────────┐  ┌──────────────┐
+ │ MicroVM   │   │ Runtime B            │  │  Bedrock     │
+ │ control   │   │ Lambda MicroVM       │  │  (Opus 4.6)  │
+ │ plane     │   │ pure executor        │  └──────────────┘
+ │           │   │                      │
+ │ RunMicrovm│   │ :8080  shell  → JSON │
+ │ GetMicrovm│   │        python → JSON │
+ │ AuthToken │   │ :9000  lifecycle     │        ┌──────────────┐
+ │ Terminate │   │        hooks         │ ◀────▶ │  S3          │
+ └───────────┘   │ /tmp/workspace (disk)│  aws   │ tenants/{id}/│
+                 └──────────────────────┘  cli   │ datasets|... │
+                                                 └──────────────┘
 ```
+
+- **Runtime A → MicroVM control plane** (`boto3 lambda-microvms`): start/stop the VM.
+- **Runtime A → Runtime B** (HTTPS + `X-aws-proxy-auth`): the two tools post `shell`/`python`.
+- **Runtime A → Bedrock**: Phase 2 report (report no longer lives in Runtime B).
+- **Runtime B ↔ S3** (`aws cli`): Runtime B downloads inputs / uploads chart+CSV outputs.
+- **Runtime A → S3**: Runtime A uploads the final `analysis_report.md`.
 
 ---
 
-## Data flow (no Mountpoint — local disk + S3 via CLI)
+## Data flow — sequence
+
+One request, top to bottom. `A` = Runtime A, `B` = Runtime B (MicroVM).
+
+```
+Frontend          Runtime A                 MicroVM CP    Runtime B (MicroVM)      S3 / Bedrock
+   │  invoke         │                          │              │                       │
+   │ ───────────────▶│                          │              │                       │
+   │                 │ ① run_microvm ──────────▶│              │                       │
+   │                 │    poll until RUNNING ◀───│ (~2.4s)      │                       │
+   │                 │    create auth token ────▶│              │                       │
+   │ ◀── status ─────│   "MicroVM 就绪"          │              │                       │
+   │                 │                                          │                       │
+   │                 │ ② Phase 1: Agent A stream_async (Opus)   │                       │
+   │ ◀── status ─────│   shell  ───────────────────────────────▶│ aws s3 cp datasets ─▶│ download
+   │                 │                                          │   → /tmp/workspace    │
+   │ ◀── status ─────│   python ───────────────────────────────▶│ pandas 读/算/出图     │
+   │ ◀── status ─────│   python ───────────────────────────────▶│ → /tmp/workspace/out  │
+   │ ◀── status ─────│   shell  ───────────────────────────────▶│ aws s3 cp output ───▶│ upload csv+png
+   │ ◀── status ─────│   "数据准备完成"          (analysis_result 文本回到 A)            │
+   │                 │                                          │                       │
+   │                 │ ③ Phase 2: report rendered IN Runtime A  │                       │
+   │ ◀── status ─────│   converse_stream(Opus, analysis_result) ───────────────────────▶│ Bedrock
+   │ ◀── chunk ──────│   (报告逐 token 流式)                                             │
+   │ ◀── chunk ──────│                                                                  │
+   │                 │   put_object(analysis_report.md) ───────────────────────────────▶│ upload report
+   │ ◀── done ───────│   s3_keys=[report.md]                    │                       │
+   │                 │ ④ finally: terminate_microvm ───────────▶│ (VM 回收, 磁盘销毁)   │
+```
+
+Verified on AWS us-west-2: 10 status + 745 chunk + 1 done = 756 events, 184s, cold start 2.25s.
+
+---
+
+## Disk reuse & why outputs go to S3 via CLI (not a mount)
 
 Runtime B has a real local disk (`/tmp/workspace`, up to 32 GB). Files persist
-across `shell`/`python` calls **within the same MicroVM**, so the flow is:
+across `shell`/`python` calls **within the same MicroVM**:
 
 ```
-shell:  aws s3 cp s3://bucket/tenants/.../datasets/ /tmp/workspace/ --recursive  ← download to local disk
-python: pd.read_csv("/tmp/workspace/...")                                         ← read local disk
-        df.to_csv("/tmp/workspace/output/x.csv")                                  ← write local disk (call 1)
-python: plt.savefig("/tmp/workspace/output/x.png")                                ← write local disk (call 2, reuses disk)
-shell:  aws s3 cp /tmp/workspace/output/ s3://bucket/.../reports/ --recursive    ← upload outputs to S3
+shell : aws s3 cp s3://.../datasets/ /tmp/workspace/ --recursive   download → local disk
+python: pd.read_csv("/tmp/workspace/...")                          read local disk
+        df.to_csv("/tmp/workspace/output/x.csv")                   write local disk  (call 1)
+python: plt.savefig("/tmp/workspace/output/x.png")                 write local disk  (call 2, same disk reused)
+shell : aws s3 cp /tmp/workspace/output/ s3://.../reports/ -r      upload outputs → S3
 ```
 
-**Why S3 access uses the AWS CLI / boto3 PUT, not a mounted filesystem:**
+**Why S3 outputs use `aws cli` / boto3 PUT, not a mounted filesystem:**
 Mounting S3 as a filesystem (Mountpoint-for-S3, FUSE) is possible inside a MicroVM
 (install `mount-s3` + `additionalOsCapabilities: ["ALL"]`), but its write semantics
 are constrained — sequential whole-file writes only, **no append, no rename** on
