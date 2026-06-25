@@ -47,12 +47,12 @@ flowchart TB
     BR["Bedrock<br/>(Opus 4.6)"]
     S3[("S3<br/>tenants/{id}/datasets<br/>tenants/{id}/reports")]
 
-    FE -->|"invoke_agent_runtime · SSE: status/chunk/done"| RA
-    RA -->|"boto3 lambda-microvms (start/stop VM)"| CP
-    RA -->|"HTTPS + X-aws-proxy-auth (shell/python)"| RB
-    RA -->|"converse_stream (Phase 2 report)"| BR
-    RB <-->|"aws cli: download inputs / upload csv+png"| S3
-    RA -->|"put_object analysis_report.md"| S3
+    FE -->|"invoke_agent_runtime<br/>SSE: status / chunk / done"| RA
+    RA -->|"boto3 lambda-microvms<br/>start / stop VM"| CP
+    RA -->|"HTTPS + X-aws-proxy-auth<br/>shell / python"| RB
+    RA -->|"converse_stream<br/>Phase 2 report"| BR
+    RB <-->|"aws cli<br/>download inputs / upload csv+png"| S3
+    RA -->|"put_object<br/>analysis_report.md"| S3
 ```
 
 | Edge | Protocol | Purpose |
@@ -121,6 +121,40 @@ sequenceDiagram
 ```
 
 Verified on AWS us-west-2: 10 status + 745 chunk + 1 done = 756 events, 184s, cold start 2.25s.
+
+### SSE event stream (actual output)
+
+```
+[status]  正在启动 MicroVM 工作站...              ← ① run_microvm
+[status]  MicroVM 就绪 (2.25s)                     ← cold start (PENDING→RUNNING)
+[status]  Agent 开始分析...
+[status]  正在执行: runtime_b_shell                ← ② Phase 1, 每个 tool call 实时
+[status]  正在执行: runtime_b_python
+[status]  正在执行: runtime_b_shell
+[status]  数据准备完成
+[status]  正在生成分析报告 (Opus streaming)...      ← ③ Phase 2, 报告在 A 渲染
+[chunk]   # 2026 Q1 各区域销售达成率分析报告 ...    ← 745 chunks 流式
+[chunk]   ## 概述 ...
+[done]    s3_keys: [analysis_report.md]            ← put_object 完成, MicroVM 在 finally 中 terminate
+```
+
+---
+
+## MicroVM lifecycle states
+
+```mermaid
+stateDiagram-v2
+    [*] --> PENDING: run_microvm
+    PENDING --> RUNNING: ~2.3s (snapshot resume)
+    RUNNING --> RUNNING: Agent loop + report
+    RUNNING --> TERMINATING: entrypoint finally → terminate_microvm
+    TERMINATING --> TERMINATED: 磁盘+内存销毁 (不可恢复)
+    TERMINATED --> [*]
+```
+
+- Idle policy 配了 auto-suspend (`maxIdleDurationSeconds=900`)，但本工作流单请求秒级完成，
+  通常在 idle 触发前就 terminate。suspend/resume 主要服务长 idle 的交互式场景。
+- `maximumDurationInSeconds=1800` (30 min) 安全上限；8h 硬上限见下文。
 
 ---
 

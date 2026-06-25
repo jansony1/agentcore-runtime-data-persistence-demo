@@ -7,7 +7,7 @@ final report itself.
 
 > Changes from V3: Runtime B moved from AgentCore Runtime to a Lambda MicroVM,
 > and report rendering moved out of Runtime B into Runtime A. V3 remains on the
-> `main` branch. See [DESIGN_V5.md](DESIGN_V5.md) and [FLOWCHART_V5.md](FLOWCHART_V5.md).
+> `main` branch. See [DESIGN_V5.md](DESIGN_V5.md) for diagrams and design.
 
 ## Architecture
 
@@ -27,12 +27,12 @@ flowchart TB
     BR["Bedrock<br/>(Opus 4.6)"]
     S3[("S3<br/>tenants/{id}/datasets<br/>tenants/{id}/reports")]
 
-    FE -->|"invoke_agent_runtime · SSE: status/chunk/done"| RA
-    RA -->|"boto3 lambda-microvms (start/stop VM)"| CP
-    RA -->|"HTTPS + X-aws-proxy-auth (shell/python)"| RB
-    RA -->|"converse_stream (Phase 2 report)"| BR
-    RB <-->|"aws cli: download inputs / upload csv+png"| S3
-    RA -->|"put_object analysis_report.md"| S3
+    FE -->|"invoke_agent_runtime<br/>SSE: status / chunk / done"| RA
+    RA -->|"boto3 lambda-microvms<br/>start / stop VM"| CP
+    RA -->|"HTTPS + X-aws-proxy-auth<br/>shell / python"| RB
+    RA -->|"converse_stream<br/>Phase 2 report"| BR
+    RB <-->|"aws cli<br/>download inputs / upload csv+png"| S3
+    RA -->|"put_object<br/>analysis_report.md"| S3
 ```
 
 **SSE end-to-end**: Phase 1 streams every tool call as it happens; Phase 2
@@ -178,8 +178,7 @@ Runtime A (one AgentCore deployment) + one MicroVM image serve N tenants.
 ```
 .
 ├── README.md                       # This file (V5)
-├── DESIGN_V5.md                    # Architecture, 8h-limit & roadmap, storage compare
-├── FLOWCHART_V5.md                 # End-to-end flow + MicroVM lifecycle
+├── DESIGN_V5.md                    # Architecture + sequence + lifecycle diagrams, 8h-limit & roadmap, storage
 ├── TESTING_V5.md                   # Bastion bypass test workflow + pitfalls
 ├── deploy_v5.sh                    # IAM roles + MicroVM image build + deploy steps
 ├── runtime_a_v5/
