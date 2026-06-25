@@ -61,6 +61,9 @@ if not BUCKET:
     raise RuntimeError("DATA_BUCKET environment variable is required")
 if not MICROVM_IMAGE_ARN and not RUNTIME_B_URL:
     raise RuntimeError("MICROVM_IMAGE_ARN or RUNTIME_B_URL is required")
+# Deployed path needs an execution role, or the MicroVM can't reach S3 (aws s3 cp fails cryptically).
+if MICROVM_IMAGE_ARN and not MICROVM_EXEC_ROLE_ARN:
+    raise RuntimeError("MICROVM_EXEC_ROLE_ARN is required when MICROVM_IMAGE_ARN is set")
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s | %(levelname)-7s | %(message)s", datefmt="%H:%M:%S")
@@ -72,10 +75,6 @@ microvms = boto3.client("lambda-microvms", region_name=REGION,
 
 # ---------- Per-request MicroVM connection (module-level: single request per microVM) ----------
 _mvm = {"id": None, "endpoint": None, "token": None, "tenant": "default", "session": "default"}
-
-
-def get_tenant_id() -> str:
-    return _mvm["tenant"]
 
 
 # ---------- MicroVM lifecycle ----------
@@ -322,14 +321,13 @@ async def invoke(payload: dict, context: RequestContext):
         current_tool_name = None
 
         async for event in agent.stream_async(
-            f"租户数据在 S3: s3://{BUCKET}/{s3_prefix}\n"
-            f"请下载数据并完成以下分析任务: {message}\n"
-            f"输出文件保存到 /tmp/workspace/output/ 并上传回 s3://{BUCKET}/{s3_output_prefix}"
+            f"请完成以下分析任务: {message}"
         ):
             if not isinstance(event, dict):
                 continue
             event_type = event.get("type", "")
 
+            # Push a status line the first time each tool call appears.
             if event_type == "tool_use_stream":
                 tool_info = event.get("current_tool_use", {})
                 tool_name = tool_info.get("name", "")
@@ -337,12 +335,6 @@ async def invoke(payload: dict, context: RequestContext):
                     current_tool_name = tool_name
                     yield {"type": "status", "stage": "analysis",
                            "message": f"正在执行: {tool_name}"}
-            elif event_type == "tool_result":
-                tr = event.get("tool_result", {})
-                status = tr.get("status", "unknown")
-                yield {"type": "status", "stage": "analysis",
-                       "message": f"{current_tool_name} 完成 (status={status})"}
-                current_tool_name = None
             elif "data" in event and event.get("data"):
                 analysis_result += str(event["data"])
             elif "result" in event:

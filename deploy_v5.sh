@@ -23,6 +23,17 @@ OPUS_MODEL_ID="${OPUS_MODEL_ID:-us.anthropic.claude-opus-4-6-v1}"
 
 echo "Region=$REGION Account=$ACCOUNT Bucket=$DATA_BUCKET Image=$IMAGE_NAME"
 
+# The build runs in $REGION and can only read a same-region artifact bucket.
+# (A cross-region artifact fails the build with "artifact is inaccessible ...".)
+ART_REGION=$(aws s3api get-bucket-location --bucket "$ARTIFACT_BUCKET" \
+  --query 'LocationConstraint' --output text 2>/dev/null || echo "MISSING")
+[ "$ART_REGION" = "None" ] && ART_REGION="us-east-1"   # API returns None for us-east-1
+if [ "$ART_REGION" != "$REGION" ]; then
+  echo "ERROR: artifact bucket '$ARTIFACT_BUCKET' is in '$ART_REGION' but the build runs in '$REGION'."
+  echo "       Set ARTIFACT_BUCKET to a bucket in $REGION (the data bucket can stay elsewhere)."
+  exit 1
+fi
+
 # ---------- 1. IAM: MicroVM build role ----------
 BUILD_ROLE_NAME="${BUILD_ROLE_NAME:-MicrovmBuildRole-v5}"
 cat > /tmp/mvm-build-trust.json <<EOF
@@ -68,8 +79,10 @@ echo "Exec role: $EXEC_ROLE_ARN"
 aws s3 cp /tmp/runtime_b_v5.zip "s3://$ARTIFACT_BUCKET/microvm/runtime_b_v5.zip" --region "$REGION"
 echo "Artifact: s3://$ARTIFACT_BUCKET/microvm/runtime_b_v5.zip"
 
-# ---------- 4. Create the MicroVM image (with /ready + /run hooks on port 9000) ----------
-# Hook paths are fixed by the service; we only declare the port and timeouts.
+# ---------- 4. Create the MicroVM image (enable /ready + /run hooks on port 9000) ----------
+# IMPORTANT: hook fields are ENABLED/DISABLED toggles, NOT paths. The hook paths
+# (/aws/lambda-microvms/runtime/v1/<name>) are fixed by the service; you only
+# declare the port + which hooks are on. Passing a path → ValidationException.
 aws lambda-microvms create-microvm-image \
   --region "$REGION" \
   --name "$IMAGE_NAME" \
@@ -77,8 +90,8 @@ aws lambda-microvms create-microvm-image \
   --base-image-arn "$BASE_IMAGE_ARN" \
   --build-role-arn "$BUILD_ROLE_ARN" \
   --hooks '{"port":9000,
-            "microvmImageHooks":{"ready":"/aws/lambda-microvms/runtime/v1/ready","readyTimeoutInSeconds":120},
-            "microvmHooks":{"run":"/aws/lambda-microvms/runtime/v1/run","runTimeoutInSeconds":30}}' \
+            "microvmImageHooks":{"ready":"ENABLED","readyTimeoutInSeconds":120},
+            "microvmHooks":{"run":"ENABLED","runTimeoutInSeconds":30}}' \
   || echo "create-microvm-image may already exist; use update-microvm-image to ship new code"
 
 echo "Poll image state until CREATED:"
