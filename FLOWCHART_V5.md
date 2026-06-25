@@ -6,59 +6,56 @@ V5 = V3 philosophy (Agent A sole brain, Runtime B pure executor), with two chang
 
 ## End-to-End Flow
 
-```
-用户请求: "分析各区域Q1销售达成率"
-│
-▼
-┌─── Runtime A (AgentCore; Agent A = 唯一大脑) ───────────────────────────┐
-│                                                                         │
-│  @app.entrypoint (async generator → SSE)                                │
-│  │                                                                      │
-│  │  ① resolve tenant_id + session_id                                    │
-│  │                                                                      │
-│  │  ② ┌─ MicroVM 生命周期: 启动 ────────────────────────────┐          │
-│  │    │  yield status "正在启动 MicroVM 工作站..."          │          │
-│  │    │  run_microvm(image, exec_role, ingress, egress) ────┼──┐       │
-│  │    │  poll get_microvm until state==RUNNING (~2.3s)      │  │       │
-│  │    │  create_microvm_auth_token → X-aws-proxy-auth       │  │       │
-│  │    │  yield status "MicroVM 就绪 (2.25s)"                 │  │       │
-│  │    └──────────────────────────────────────────────────────┘  │     │
-│  │                                                              │ 启动  │
-│  │  ③ yield status "Agent 开始分析..."                          │ MicroVM│
-│  │                                                              ▼       │
-│  │  ④ ┌─ Phase 1: Agent A stream_async (Opus) ────────────┐  ┌────────────────────┐
-│  │    │  LLM 思考: "下载数据"                               │  │ Runtime B          │
-│  │    │   ▼ yield status "正在执行: runtime_b_shell"        │  │ (Lambda MicroVM)   │
-│  │    │   ▼ HTTPS POST {action:shell} ──────────────────────┼─▶│ :8080              │
-│  │    │   ◀──────── JSON {stdout,exit_code} ─────────────────┼──│ subprocess.run     │
-│  │    │   ▼ yield status "runtime_b_shell 完成"             │  │ (aws s3 cp 下载)   │
-│  │    │  LLM 思考: "pandas 分析"                            │  │                    │
-│  │    │   ▼ yield status "正在执行: runtime_b_python"       │  │                    │
-│  │    │   ▼ HTTPS POST {action:python} ─────────────────────┼─▶│ exec(code)         │
-│  │    │   ◀──────── JSON {stdout,output_files} ──────────────┼──│ (pandas/matplotlib)│
-│  │    │   ▼ yield status "runtime_b_python 完成"            │  │ → /tmp/workspace/  │
-│  │    │  LLM 思考: "出图 + 上传 S3"                          │  │   output/ (持久)   │
-│  │    │   ▼ HTTPS POST {action:shell: aws s3 cp ↑} ─────────┼─▶│ 上传产出到 S3       │
-│  │    │  LLM: end_turn → 退出循环                           │  └────────────────────┘
-│  │    │  analysis_result = 关键发现文本                      │            │
-│  │    └──────────────────────────────────────────────────────┘            │
-│  │                                                                         │
-│  │  ⑤ yield status "数据准备完成"                                          │
-│  │                                                                         │
-│  │  ⑥ ┌─ Phase 2: Report (在 Runtime A 内渲染, 不再调 B) ──┐               │
-│  │    │  yield status "正在生成分析报告 (Opus streaming)"   │               │
-│  │    │  bedrock.converse_stream(Opus, analysis_result)     │               │
-│  │    │   ▼ for chunk in stream:                            │               │
-│  │    │       yield {"type":"chunk","content": chunk} ──────┼─▶ 前端逐 token │
-│  │    │  s3.put_object(analysis_report.md)                  │               │
-│  │    │  yield {"type":"done","s3_keys":[...]}              │               │
-│  │    └──────────────────────────────────────────────────────┘             │
-│  │                                                                         │
-│  │  ⑦ finally: terminate_microvm(id) ──────────────────────────┐          │
-│  │     yield 结束; MicroVM 回收, 状态/磁盘销毁                  │ 回收      │
-│  └──────────────────────────────────────────────────────────────┼─────────┘
-│                                                                  ▼
-└──────────────────────────────────────────────────────── MicroVM TERMINATED
+```mermaid
+sequenceDiagram
+    autonumber
+    participant FE as Frontend
+    participant A as Runtime A (brain)
+    participant CP as MicroVM control plane
+    participant B as Runtime B (MicroVM)
+    participant S3 as S3
+    participant BR as Bedrock
+
+    FE->>A: invoke "分析各区域Q1销售达成率"
+
+    rect rgb(238,244,255)
+    note over A,CP: ① 启动 MicroVM
+    A->>CP: run_microvm(image, exec_role, ingress, egress)
+    CP-->>A: state RUNNING (~2.3s)
+    A->>CP: create_microvm_auth_token → X-aws-proxy-auth
+    A-->>FE: status "MicroVM 就绪"
+    end
+
+    rect rgb(238,255,238)
+    note over A,S3: ② Phase 1 — Agent A stream_async (Opus) 驱动 Runtime B
+    A->>B: shell  aws s3 cp datasets
+    B->>S3: download inputs
+    S3-->>B: CSV → /tmp/workspace
+    B-->>A: JSON {stdout, exit_code}
+    A-->>FE: status "正在执行: runtime_b_shell"
+    A->>B: python  pandas 分析 + matplotlib 出图
+    B-->>A: JSON {stdout, output_files}
+    A-->>FE: status "正在执行: runtime_b_python"
+    A->>B: shell  aws s3 cp output
+    B->>S3: upload csv + png
+    A-->>FE: status "数据准备完成"
+    Note over A: analysis_result = 关键发现文本
+    end
+
+    rect rgb(255,247,234)
+    note over A,BR: ③ Phase 2 — 报告在 Runtime A 内渲染 (不再调 B)
+    A->>BR: converse_stream(Opus, analysis_result)
+    BR-->>A: report tokens
+    A-->>FE: chunk (报告逐 token)
+    A->>S3: put_object analysis_report.md
+    A-->>FE: done (s3_keys)
+    end
+
+    rect rgb(255,238,238)
+    note over A,B: ④ finally — 回收
+    A->>CP: terminate_microvm
+    note over B: VM 回收, 状态/磁盘销毁 (不可恢复)
+    end
 ```
 
 ## SSE Event Stream (actual, verified on AWS us-west-2)
@@ -84,12 +81,14 @@ V5 = V3 philosophy (Agent A sole brain, Runtime B pure executor), with two chang
 
 ## Lifecycle States (MicroVM, verified)
 
-```
-run_microvm → PENDING ──(~2.3s)──▶ RUNNING ──(Agent loop + report)──▶ 仍 RUNNING
-                                                                          │
-                                              entrypoint finally:         ▼
-                                              terminate_microvm → TERMINATING → TERMINATED
-                                                                  (磁盘+内存销毁, 不可恢复)
+```mermaid
+stateDiagram-v2
+    [*] --> PENDING: run_microvm
+    PENDING --> RUNNING: ~2.3s (snapshot resume)
+    RUNNING --> RUNNING: Agent loop + report
+    RUNNING --> TERMINATING: entrypoint finally → terminate_microvm
+    TERMINATING --> TERMINATED: 磁盘+内存销毁 (不可恢复)
+    TERMINATED --> [*]
 ```
 
 - Idle policy 配置了 auto-suspend (maxIdleDurationSeconds=900)，但本工作流是单请求秒级完成，
