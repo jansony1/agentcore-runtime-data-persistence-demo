@@ -199,6 +199,11 @@ def build_system_prompt(tenant_id: str, s3_prefix: str, s3_output_prefix: str) -
    - 输出文件写到: WORKSPACE + "/output/"
    - 可用库: pandas, numpy, matplotlib
 
+## 环境已就绪（不要重复安装/配置）
+- pandas / numpy / matplotlib / aws cli **已预装**，直接 import 使用，**禁止 pip install**。
+- matplotlib 中文字体**已配置好**，直接画图即可，**不要**自己处理字体、扫描字体或设置 rcParams。
+- 多花时间安装/配置只会拖慢任务，且通常会失败。
+
 ## 工作流程
 1. 用 runtime_b_shell 从 S3 下载数据到工作站:
    aws s3 cp s3://{BUCKET}/{s3_prefix} /tmp/workspace/ --recursive

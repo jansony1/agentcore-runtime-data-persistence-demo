@@ -12,24 +12,32 @@ final report itself.
 ## Architecture
 
 ```
-Runtime A (AgentCore; Agent A = sole brain, Opus 4.6)
-  │  ① run_microvm → poll RUNNING (~2.4s) → create_microvm_auth_token
-  │
-  │  ② Strands Agent decides everything (Phase 1, stream_async):
-  │    → runtime_b_shell("aws s3 cp ...")     ┐ HTTPS POST to MicroVM endpoint
-  │    → runtime_b_python("import pandas ...") │ (X-aws-proxy-auth)
-  │    → runtime_b_python("import matplotlib") ┘
-  │
-  │  ③ Phase 2: Runtime A renders report itself (converse_stream Opus → SSE)
-  │             → upload analysis_report.md to S3
-  │
-  │  ④ finally: terminate_microvm
-  ▼
-Runtime B (Lambda MicroVM; pure executor, no decision-making)
-  ├── :8080 POST action=shell   → subprocess.run()  → JSON response
-  ├── :8080 POST action=python  → exec()            → JSON response
-  └── :9000 lifecycle hooks: /ready /run /resume /suspend /terminate
-       /run resets /tmp/workspace (persists across calls within one MicroVM)
+   Frontend ──invoke (SSE: status / chunk / done)──┐
+                                                    ▼
+ ┌────────────────────────────────────────────────────────────┐
+ │ Runtime A  ·  AgentCore  ·  Agent A (Opus 4.6) = sole brain  │
+ │                                                              │
+ │  ① run / terminate the MicroVM                              │
+ │  ② Phase 1 — drive Runtime B (stream_async)                 │
+ │  ③ Phase 2 — render report itself, upload to S3             │
+ └───┬──────────────────┬───────────────────────┬──────────────┘
+     │ boto3            │ HTTPS + token         │ Bedrock
+     │ lambda-microvms  │ shell / python        │ converse_stream
+     ▼                  ▼                       ▼
+ ┌──────────┐   ┌─────────────────────┐   ┌──────────────┐
+ │ MicroVM  │   │ Runtime B           │   │   Bedrock    │
+ │ control  │   │ Lambda MicroVM      │   │  (Opus 4.6)  │
+ │ plane    │   │ pure executor       │   └──────────────┘
+ │          │   │                     │
+ │ Run /    │   │ :8080  shell → JSON │         ┌──────────────┐
+ │ Get /    │   │        python→ JSON │ ──aws──▶ │  S3          │
+ │ Token /  │   │ :9000  lifecycle    │   cli   │ tenants/{id}/│
+ │ Terminate│   │ /tmp/workspace disk │ ◀────── │              │
+ └──────────┘   └─────────────────────┘         └──────────────┘
+                pre-baked image: python +              ▲
+                pandas/numpy/matplotlib + aws cli       │ Runtime A
+                + CJK fonts (no install at runtime)     │ uploads report.md
+                                                        └──────────────
 ```
 
 **SSE end-to-end**: Phase 1 streams every tool call as it happens; Phase 2
@@ -37,6 +45,10 @@ streams the report token-by-token from Runtime A. No black box.
 
 **Report moved to Runtime A**: Runtime B no longer has an LLM/report action —
 it is a pure shell+python executor. Runtime A owns report rendering and upload.
+
+**Image is pre-baked**: pandas/numpy/matplotlib, aws cli, and CJK fonts are
+installed into the MicroVM image and captured in its snapshot — the agent never
+installs or configures anything at runtime (the system prompt forbids it).
 
 See [DESIGN_V5.md](DESIGN_V5.md) for architecture, the 8-hour limit & roadmap
 notes, and the storage comparison vs AgentCore.
@@ -70,7 +82,12 @@ REGION=$REGION DATA_BUCKET=$DATA_BUCKET ./deploy_v5.sh
 ```
 
 `deploy_v5.sh` creates the build/execution IAM roles, packages `runtime_b_v5/`,
-uploads it to S3, and calls `create-microvm-image`. Poll until `CREATED`:
+uploads it to S3, and calls `create-microvm-image`. This is where all
+dependencies (pandas/numpy/matplotlib, aws cli, CJK fonts) are **baked into the
+image** via the Dockerfile and frozen in the snapshot — nothing installs at
+request time. To add libraries, edit `runtime_b_v5/requirements.txt` and
+rebuild; see **Dependency pre-baking** in [DESIGN_V5.md](DESIGN_V5.md) for the
+exact steps. Poll until `CREATED`:
 
 ```bash
 aws lambda-microvms get-microvm-image --region $REGION \

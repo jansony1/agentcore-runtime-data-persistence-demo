@@ -130,6 +130,75 @@ is simpler and avoids the write pitfalls.
 
 ---
 
+## Dependency pre-baking (install once, at image-build time)
+
+**All runtime dependencies are installed into the MicroVM image and captured in
+its snapshot. The agent never installs anything at request time** — that would
+add minutes per request and often fail. The system prompt explicitly forbids
+`pip install` and font configuration.
+
+### How it works
+
+When you call `create-microvm-image`, Lambda runs your `Dockerfile` once,
+starts the app, and takes a Firecracker snapshot of the fully-initialized
+memory+disk. Every `run-microvm` resumes from that snapshot — packages, fonts,
+and aws cli are already present. This is the same reason cold start is ~2.4s
+(resume, not boot+install).
+
+### What is baked in (`runtime_b_v5/Dockerfile`)
+
+```dockerfile
+FROM public.ecr.aws/lambda/microvms:al2023-minimal
+
+# OS packages: python, pip, and CJK fonts (al2023-minimal has none → matplotlib
+# would render Chinese as boxes without these).
+RUN dnf install -y python3 python3-pip google-noto-sans-cjk-ttc-fonts && dnf clean all
+
+WORKDIR /app
+COPY requirements.txt .
+# Python libs + awscli via pip. Install awscli via pip (NOT dnf): the dnf awscli
+# ships a 2nd copy under /usr/bin that can't see pip deps (dateutil) → ImportError.
+RUN pip3 install --no-cache-dir awscli -r requirements.txt   # requirements: pandas, numpy, matplotlib
+
+COPY main.py .
+CMD ["python3", "main.py"]                                   # /ready hook → Lambda snapshots
+```
+
+`runtime_b_v5/requirements.txt`:
+
+```
+pandas
+numpy
+matplotlib
+```
+
+Runtime B's `main.py` also sets the matplotlib default CJK font **once at module
+load** (`_configure_cjk_font()`), so chart code needs no font handling.
+
+### Steps to (re)bake dependencies
+
+1. **Edit deps** — add libraries to `runtime_b_v5/requirements.txt` (or OS
+   packages to the `dnf install` line in the Dockerfile).
+2. **Package + upload** — zip `main.py`, `requirements.txt`, `Dockerfile` and
+   upload to a **same-region** S3 artifact bucket:
+   ```bash
+   cd runtime_b_v5 && zip -r /tmp/rb.zip main.py requirements.txt Dockerfile
+   aws s3 cp /tmp/rb.zip s3://<artifact-bucket>/microvm/runtime_b_v5.zip --region <region>
+   ```
+3. **Build the image** — first time: `create-microvm-image`; to ship new deps
+   later: `update-microvm-image` (a new image version). `deploy_v5.sh` does the
+   first build; both require `--base-image-arn` + `--build-role-arn` each call.
+4. **Wait for `CREATED`/`UPDATED`** — poll `get-microvm-image`. The Dockerfile
+   ran on the build fleet; the result is a snapshot, not a per-request install.
+5. **Point Runtime A at it** — set `MICROVM_IMAGE_ARN` (the latest active
+   version is used by default).
+
+> Verify a package is really baked: `run-microvm`, then
+> `POST {"action":"python","code":"import pandas, matplotlib; print('ok')"}` —
+> it should succeed with no install step.
+
+---
+
 ## ⚠️ 8-hour lifecycle limit & roadmap
 
 > This section records a real constraint and the planned fix. **V5 does not
