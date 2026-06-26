@@ -87,7 +87,7 @@ Both run the sandbox on Firecracker, so isolation is the same. The trade is
 | Isolation | Firecracker microVM | Firecracker microVM (same) |
 | Cold start (service-side startup) | **~1.3–1.6s** — `run_microvm` → `RUNNING` provisioning (n=4) | **~4.3s** (light image) to **~9.5s** (heavy image) on a fresh session; **~0.5–0.7s** on a warm-pool microVM; **~0.1–0.2s** warm same-session |
 | Invocation / params | HTTPS `POST` to the VM endpoint with `X-aws-proxy-auth`; params in the JSON body (`{"action":"shell","command":...}`) | `bedrock-agentcore invoke_agent_runtime(agentRuntimeArn, runtimeSessionId, payload=<json bytes>)`; params in the payload |
-| Reuse same VM vs new VM | no session-id routing — **every `run_microvm` creates a brand-new VM** (verified: distinct `microvmId` + endpoint each call). So reuse → call `run_microvm` **once**, persist `ep = resp["endpoint"]`, then `POST https://{ep}/` on every later request (same VM, same disk); new → call `run_microvm(...)` again (different VM, isolated disk) | reuse → `invoke_agent_runtime(..., runtimeSessionId="sess-abc")` with the **same** id (platform routes to the same compute); new → call with a **different** `runtimeSessionId`. Routed automatically |
+| Reuse same VM vs new VM | no session-id routing — **every `run_microvm` creates a brand-new VM** (distinct `microvmId` + endpoint each call). So reuse → call `run_microvm` **once**, persist `ep = resp["endpoint"]`, then `POST https://{ep}/` on every later request (same VM, same disk); new → call `run_microvm(...)` again (different VM, isolated disk) | reuse → `invoke_agent_runtime(..., runtimeSessionId="sess-abc")` with the **same** id (platform routes to the same compute); new → call with a **different** `runtimeSessionId`. Routed automatically |
 | Lifecycle control | **explicit** — you `run` / `suspend` / `terminate`; idle policy (`maxIdleDurationSeconds`, `suspendedDurationSeconds`) is configurable | **managed** — the compute is kept alive while your `/ping` returns `HealthyBusy`, auto-suspended after ~15 min `Healthy` (idle); `StopRuntimeSession` to stop early |
 | Max runtime | **8 h hard cap per VM, terminal** — running + suspended combined; suspend does NOT reset it; on expiry the VM is destroyed and you must start a new one | **8 h per compute, but the session survives** — at 8 h the compute is recycled; the next invocation auto-provisions a **fresh compute (another 8 h)**, and the session stays valid until the runtime ARN is deleted |
 | Streaming (SSE) | native on the endpoint | native |
@@ -223,7 +223,7 @@ for line in resp['response'].iter_lines():
                 print(f"\n\nFiles: {[f['s3_uri'] for f in event['s3_keys']]}")
 ```
 
-**Expected output (verified on AWS us-west-2 — 756 events, 184s):**
+**Expected output (AWS us-west-2 — 756 events, 184s):**
 ```
 [provision] 正在启动 MicroVM 工作站...            ← run_microvm
 [provision] MicroVM 就绪 (2.25s)                  ← cold start PENDING→RUNNING

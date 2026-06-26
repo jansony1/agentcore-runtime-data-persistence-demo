@@ -138,7 +138,7 @@ sequenceDiagram
     end
 ```
 
-Verified on AWS us-west-2: 10 status + 745 chunk + 1 done = 756 events, 184s.
+On AWS us-west-2: 10 status + 745 chunk + 1 done = 756 events, 184s.
 (The 2.25s the deployed Orchestrator logged below is its coarse 1s-poll loop; a
 fine-grained probe measures service-side startup (`run_microvm`→`RUNNING`) at
 ~1.3–1.6s — see README.)
@@ -279,7 +279,7 @@ load** (`_configure_cjk_font()`), so chart code needs no font handling.
 > implement long-running (>8h) handling** — the current analysis workload is
 > minutes-long. Documented here so the relay design is ready when needed.
 
-### The limit (verified against AWS docs, 2026-06)
+### The limit (per AWS docs, 2026-06)
 
 - A MicroVM's `maximumDurationInSeconds` caps **running + suspended combined** at
   **28,800s (8h)**. Suspending does **not** extend the clock — idle time still
