@@ -89,7 +89,7 @@ Both run the sandbox on Firecracker, so isolation is the same. The trade is
 | Invocation / params | HTTPS `POST` to the VM endpoint with `X-aws-proxy-auth`; params in the JSON body (`{"action":"shell","command":...}`) | `bedrock-agentcore invoke_agent_runtime(agentRuntimeArn, runtimeSessionId, payload=<json bytes>)`; params in the payload |
 | Lifecycle control | **explicit** — you `run` / `suspend` / `terminate`; idle policy is configurable | managed/opaque — platform reclaims on idle (~15 min) |
 | Session routing | you hold the endpoint + auth token per request | automatic via `runtimeSessionId` |
-| Max runtime | 8 h hard cap (running + suspended combined) | 8 h hard cap (`maxLifetime`) |
+| Max runtime | 8 h hard cap — **running + suspended combined; suspend does NOT reset it** | 8 h hard cap (`maxLifetime`) |
 | Streaming (SSE) | native on the endpoint | native |
 | Disk within a session | up to **32 GB**, persists across suspend/resume | size **not published**; persists across stop/resume |
 | Durable result store | **write to S3** (results land in `tenants/{id}/reports/`) | same — write to S3 (or a managed `/mnt/workspace`, but it's per-session, not shared) |
@@ -104,6 +104,15 @@ Both run the sandbox on Firecracker, so isolation is the same. The trade is
 > it is **not** a way to hand data to a later session. Anything that must survive
 > goes to S3. AgentCore's managed `/mnt/workspace` only extends this within one
 > session's stop/resume cycle; it is isolated per session, not shared across them.
+
+> **The 8 h cap and suspend/resume don't conflict — but suspend doesn't buy time.**
+> `maximumDurationInSeconds` counts **running + suspended together** from
+> `run_microvm`; suspending pauses billing, not the clock. Example: run 7 h →
+> suspend → resume leaves **~1 h**, not a fresh 8 h. To exceed 8 h today you start
+> a new VM and restore from S3 (the relay pattern in [DESIGN_V5.md](DESIGN_V5.md)).
+> **Roadmap:** AWS's planned **snapshot-to-S3 + restore** will solve this directly —
+> snapshot the full VM (memory + disk) to S3 and restore into a fresh-lease VM,
+> carrying state a new VM otherwise can't.
 
 **Pick MicroVM when** you want explicit per-request sandboxes and lifecycle
 control (and don't mind managing the endpoint). **Pick AgentCore when** you want
