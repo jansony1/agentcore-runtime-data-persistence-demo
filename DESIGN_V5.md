@@ -44,6 +44,7 @@ flowchart TB
     BR["<b>Bedrock (Opus)</b><br/><i>the LLM that reasons<br/>and writes the report</i>"]
 
     S3[("<b>S3</b><br/><i>per-tenant data in,<br/>results out</i>")]
+    ALT[("<b>or ClickHouse / ES</b><br/><i>swap in another store<br/>without touching the brain</i>")]
 
     FE -->|"① ask"| RA
     RA -->|"② start / stop a sandbox"| CP
@@ -52,6 +53,7 @@ flowchart TB
     RB <-->|"raw data / charts + CSV"| S3
     RA -->|"final report.md"| S3
     RA -.->|"live progress + report"| FE
+    S3 -.->|"interchangeable<br/>data store"| ALT
 ```
 
 What each connection carries, technically:
