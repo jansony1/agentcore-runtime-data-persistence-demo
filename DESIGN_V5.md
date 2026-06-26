@@ -27,41 +27,43 @@ Runtime B is a pure executor) — but makes two structural changes:
 
 ## Architecture — components
 
-Six distinct actors. Each external AWS service is its own node — note that the
-**MicroVM control plane** (Lambda MicroVMs API), **Runtime B** (the running
-MicroVM), **Bedrock**, and **S3** are four separate things, not one.
+Each box states what that component is *for*; each arrow is an action. The four
+external pieces — the **control plane** (an API that starts/stops sandboxes),
+the **sandbox** itself, **Bedrock**, and **S3** — are separate things.
 
 ```mermaid
 flowchart TB
-    FE["Frontend / caller"]
+    FE["<b>Frontend</b><br/><i>sends the question,<br/>watches progress + report live</i>"]
 
-    subgraph RA["Runtime A · AgentCore — Agent A (Opus 4.6) = sole brain"]
-        direction TB
-        L["① MicroVM lifecycle: run / terminate"]
-        P1["② Phase 1: drive Runtime B (shell / python)"]
-        P2["③ Phase 2: render report + upload"]
-    end
+    RA["<b>Runtime A — the brain</b> (AgentCore)<br/><i>understands the request, decides every step,<br/>commands the sandbox, writes the final report.<br/>Never touches data files itself.</i>"]
 
-    CP["MicroVM control plane<br/>(Lambda MicroVMs API)<br/>RunMicrovm · GetMicrovm<br/>CreateAuthToken · Terminate"]
-    RB["Runtime B · Lambda MicroVM<br/>pure executor<br/>:8080 shell / python → JSON<br/>:9000 lifecycle hooks<br/>/tmp/workspace disk"]
-    BR["Bedrock<br/>(Opus 4.6)"]
-    S3[("S3<br/>tenants/{id}/datasets<br/>tenants/{id}/reports")]
+    CP["<b>MicroVM control plane</b><br/><i>starts a fresh isolated sandbox on demand,<br/>shuts it down when done</i>"]
 
-    FE -->|"invoke_agent_runtime<br/>SSE: status / chunk / done"| RA
-    RA -->|"boto3 lambda-microvms<br/>start / stop VM"| CP
-    RA -->|"HTTPS + X-aws-proxy-auth<br/>shell / python"| RB
-    RA -->|"converse_stream<br/>Phase 2 report"| BR
-    RB <-->|"aws cli<br/>download inputs / upload csv+png"| S3
-    RA -->|"put_object<br/>analysis_report.md"| S3
+    RB["<b>Runtime B — the sandbox</b> (Lambda MicroVM)<br/><i>runs the brain's shell/Python in isolation:<br/>fetches data, computes, makes charts.<br/>Makes no decisions.</i>"]
+
+    BR["<b>Bedrock (Opus)</b><br/><i>the LLM that reasons<br/>and writes the report</i>"]
+
+    S3[("<b>S3</b><br/><i>per-tenant data in,<br/>results out</i>")]
+
+    FE -->|"① ask"| RA
+    RA -->|"② start / stop a sandbox"| CP
+    RA -->|"③ prepare data (shell / Python)"| RB
+    RA -->|"④ reason, then write report"| BR
+    RB <-->|"raw data / charts + CSV"| S3
+    RA -->|"final report.md"| S3
+    RA -.->|"live progress + report"| FE
 ```
 
-| Edge | Protocol | Purpose |
-|------|----------|---------|
-| Runtime A → MicroVM control plane | boto3 `lambda-microvms` | start / poll / token / terminate the VM |
-| Runtime A → Runtime B | HTTPS + `X-aws-proxy-auth` | the two tools post `shell` / `python` |
-| Runtime A → Bedrock | `converse_stream` | Phase 2 report (no longer in Runtime B) |
-| Runtime B ↔ S3 | `aws cli` | download tenant inputs / upload chart+CSV |
-| Runtime A → S3 | `put_object` | upload final `analysis_report.md` |
+What each connection carries, technically:
+
+| Connection | How |
+|------------|-----|
+| Frontend ↔ Runtime A | `invoke_agent_runtime`, replies as SSE (`status` / `chunk` / `done`) |
+| Runtime A → control plane | `boto3 lambda-microvms`: `RunMicrovm` / `GetMicrovm` / `CreateAuthToken` / `Terminate` |
+| Runtime A → Runtime B | HTTPS + `X-aws-proxy-auth`; Runtime B exposes `:8080` shell/python, `:9000` lifecycle hooks, `/tmp/workspace` disk |
+| Runtime A → Bedrock | `converse_stream` (agent reasoning during data prep, then the report) |
+| Runtime B ↔ S3 | `aws cli`: download `tenants/{id}/datasets`, upload chart+CSV |
+| Runtime A → S3 | `put_object`: final `tenants/{id}/reports/analysis_report.md` |
 
 ---
 
@@ -90,26 +92,26 @@ sequenceDiagram
     end
 
     rect rgb(238,255,238)
-    note over A,S3: ② Phase 1 — Agent A drives Runtime B (stream_async)
-    A->>B: shell  aws s3 cp datasets
+    note over A,S3: ② Prepare data — the brain drives the sandbox, step by step
+    A->>B: run shell: download datasets
     B->>S3: download inputs
     S3-->>B: CSV files → /tmp/workspace
     B-->>A: stdout
+    A-->>FE: status (each step live)
+    A->>B: run Python: analyze + make charts
+    B-->>A: stdout + output files
     A-->>FE: status
-    A->>B: python  pandas 分析 + matplotlib 出图
-    B-->>A: stdout + output_files
-    A-->>FE: status
-    A->>B: shell  aws s3 cp output
+    A->>B: run shell: upload outputs
     B->>S3: upload csv + png
     A-->>FE: status "数据准备完成"
     end
 
     rect rgb(255,247,234)
-    note over A,BR: ③ Phase 2 — report rendered IN Runtime A
-    A->>BR: converse_stream(analysis_result)
+    note over A,BR: ③ Write report — done by the brain itself
+    A->>BR: send findings, ask for report
     BR-->>A: report tokens
-    A-->>FE: chunk (报告逐 token)
-    A->>S3: put_object analysis_report.md
+    A-->>FE: chunk (report streams token by token)
+    A->>S3: upload report.md
     A-->>FE: done (s3_keys)
     end
 
@@ -128,11 +130,11 @@ Verified on AWS us-west-2: 10 status + 745 chunk + 1 done = 756 events, 184s, co
 [status]  正在启动 MicroVM 工作站...              ← ① run_microvm
 [status]  MicroVM 就绪 (2.25s)                     ← cold start (PENDING→RUNNING)
 [status]  Agent 开始分析...
-[status]  正在执行: runtime_b_shell                ← ② Phase 1, 每个 tool call 实时
+[status]  正在执行: runtime_b_shell                ← ② 准备数据, 每个步骤实时推送
 [status]  正在执行: runtime_b_python
 [status]  正在执行: runtime_b_shell
 [status]  数据准备完成
-[status]  正在生成分析报告 (Opus streaming)...      ← ③ Phase 2, 报告在 A 渲染
+[status]  正在生成分析报告 (Opus streaming)...      ← ③ 写报告, 由大脑(Runtime A)完成
 [chunk]   # 2026 Q1 各区域销售达成率分析报告 ...    ← 745 chunks 流式
 [chunk]   ## 概述 ...
 [done]    s3_keys: [analysis_report.md]            ← put_object 完成, MicroVM 在 finally 中 terminate

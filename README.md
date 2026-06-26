@@ -11,32 +11,46 @@ final report itself.
 
 ## Architecture
 
+Each box = one responsibility; each arrow = one action.
+
 ```mermaid
 flowchart TB
-    FE["Frontend / caller"]
+    FE["Frontend<br/><i>sends the question,<br/>watches progress + report live</i>"]
 
-    subgraph RA["Runtime A · AgentCore — Agent A (Opus 4.6) = sole brain"]
-        direction TB
-        L["① MicroVM lifecycle: run / terminate"]
-        P1["② Phase 1: drive Runtime B (shell / python)"]
-        P2["③ Phase 2: render report + upload"]
-    end
+    RA["<b>Runtime A — the brain</b><br/><i>understands the request, decides every step,<br/>commands the sandbox, writes the final report.<br/>Never touches data files itself.</i>"]
 
-    CP["MicroVM control plane<br/>(Lambda MicroVMs API)<br/>Run · Get · AuthToken · Terminate"]
-    RB["Runtime B · Lambda MicroVM<br/>pure executor<br/>:8080 shell / python → JSON<br/>:9000 lifecycle hooks<br/>/tmp/workspace disk<br/><br/>pre-baked image: python +<br/>pandas/numpy/matplotlib + aws cli + CJK fonts"]
-    BR["Bedrock<br/>(Opus 4.6)"]
-    S3[("S3<br/>tenants/{id}/datasets<br/>tenants/{id}/reports")]
+    CP["<b>MicroVM control plane</b><br/><i>starts a fresh, isolated sandbox on demand<br/>and shuts it down when done</i>"]
 
-    FE -->|"invoke_agent_runtime<br/>SSE: status / chunk / done"| RA
-    RA -->|"boto3 lambda-microvms<br/>start / stop VM"| CP
-    RA -->|"HTTPS + X-aws-proxy-auth<br/>shell / python"| RB
-    RA -->|"converse_stream<br/>Phase 2 report"| BR
-    RB <-->|"aws cli<br/>download inputs / upload csv+png"| S3
-    RA -->|"put_object<br/>analysis_report.md"| S3
+    RB["<b>Runtime B — the sandbox</b><br/><i>runs the brain's shell/Python in isolation:<br/>fetches data, computes, makes charts.<br/>Makes no decisions.</i>"]
+
+    BR["<b>Bedrock (Opus)</b><br/><i>the LLM that thinks<br/>and writes the report</i>"]
+
+    S3[("<b>S3</b><br/><i>per-tenant data in,<br/>results out</i>")]
+
+    FE -->|"① ask: analyze Q1 sales..."| RA
+    RA -->|"② spin up / tear down a sandbox"| CP
+    RA -->|"③ prepare data: run shell / Python"| RB
+    RA -->|"④ think (decide steps) + write report"| BR
+    RB <-->|"download raw data / upload charts+CSV"| S3
+    RA -->|"upload final report.md"| S3
+    RA -.->|"live progress + report stream"| FE
 ```
 
-**SSE end-to-end**: Phase 1 streams every tool call as it happens; Phase 2
-streams the report token-by-token from Runtime A. No black box.
+What each connection carries, technically:
+
+| Arrow | How | 
+|-------|-----|
+| Frontend ↔ Runtime A | `invoke_agent_runtime`, replies as SSE (`status` / `chunk` / `done`) |
+| Runtime A → control plane | `boto3 lambda-microvms`: run / poll / auth-token / terminate |
+| Runtime A → Runtime B | HTTPS + `X-aws-proxy-auth`; Runtime B exposes `:8080` shell/python, `:9000` lifecycle hooks |
+| Runtime A → Bedrock | `converse_stream` (agent reasoning, then report) |
+| Runtime B ↔ S3 / Runtime A → S3 | `aws cli` for data, `put_object` for the report |
+
+> Runtime B's image is **pre-baked** with python + pandas/numpy/matplotlib + aws cli + CJK fonts,
+> so the sandbox installs nothing at request time.
+
+**SSE end-to-end, no black box**: while preparing data, every sandbox step is
+pushed live; then the report streams back token-by-token as Runtime A writes it.
 
 **Report moved to Runtime A**: Runtime B no longer has an LLM/report action —
 it is a pure shell+python executor. Runtime A owns report rendering and upload.
@@ -147,11 +161,11 @@ for line in resp['response'].iter_lines():
 [provision] 正在启动 MicroVM 工作站...            ← run_microvm
 [provision] MicroVM 就绪 (2.25s)                  ← cold start PENDING→RUNNING
 [analysis]  Agent 开始分析...
-[analysis]  正在执行: runtime_b_shell             ← Phase 1 tool call 实时推送
+[analysis]  正在执行: runtime_b_shell             ← 准备数据, 每个步骤实时推送
 [analysis]  正在执行: runtime_b_python
 [analysis]  正在执行: runtime_b_shell
 [analysis]  数据准备完成
-[report]    正在生成分析报告 (Opus streaming)...  ← Phase 2 报告在 Runtime A 渲染
+[report]    正在生成分析报告 (Opus streaming)...  ← 写报告, 由 Runtime A 完成
 # 2026 Q1 各区域销售达成率分析报告               ← 逐 token
 ## 概述
 本季度全国综合达成率仅为 49.70%，所有区域均未完成既定目标...
