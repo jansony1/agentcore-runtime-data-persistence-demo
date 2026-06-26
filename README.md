@@ -91,8 +91,9 @@ Both run the sandbox on Firecracker, so isolation is the same. The trade is
 | Session routing | you hold the endpoint + auth token per request | automatic via `runtimeSessionId` |
 | Max runtime | **8 h hard cap per VM, terminal** — running + suspended combined; suspend does NOT reset it; on expiry the VM is destroyed and you must start a new one | **8 h per compute, but the session survives** — at 8 h the compute is recycled; the next invocation auto-provisions a **fresh compute (another 8 h)**, and the session stays valid until the runtime ARN is deleted |
 | Streaming (SSE) | native on the endpoint | native |
-| Disk within a session | up to **32 GB**, persists across suspend/resume | size **not published**; persists across stop/resume |
-| Durable result store | **write to S3** (results land in `tenants/{id}/reports/`) | same — write to S3 (or a managed `/mnt/workspace`, but it's per-session, not shared) |
+| Local disk (the compute's own) | up to **32 GB**; **destroyed when the VM terminates** (incl. at the 8 h cap) — not persistent | size **not published**; **destroyed when the compute is terminated/stopped** — not persistent |
+| Managed persistent mount | **none** — DIY only (Mountpoint-for-S3 / EFS in your image), so V5 just `aws s3 cp` to S3 | **native `filesystemConfigurations`** (no mount code): managed **session storage** (`/mnt/workspace`, per-session, flushed to a durable backend on stop and restored on resume), or BYO **EFS** / **S3 Files** mounts (shared across sessions/agents, VPC required) |
+| Durable result store | **S3** (results land in `tenants/{id}/reports/`) | **S3** too, plus the mounts above |
 | Network bandwidth | tied to size (2 GB/1 vCPU ≈ 4 MB/s) | not size-throttled |
 | Dependencies | **pre-baked into the image snapshot** | installed in the container image |
 
@@ -100,10 +101,13 @@ Both run the sandbox on Firecracker, so isolation is the same. The trade is
 > AWS publishes no figure for either. AgentCore's cold cost is dominated by
 > per-session attach + app import, not microVM boot, so it scales with image weight.
 
-> **Disk scope (both sides):** the sandbox disk lives and dies with the session —
-> it is **not** a way to hand data to a later session. Anything that must survive
-> goes to S3. AgentCore's managed `/mnt/workspace` only extends this within one
-> session's stop/resume cycle; it is isolated per session, not shared across them.
+> **What actually survives a restart:** the compute's **local disk does not** — it
+> is destroyed with the VM on both sides. AgentCore's `/mnt/workspace` looks like
+> it "persists across stop/resume" but the mechanism is **flush-to-durable-backend
+> on stop → restore onto a brand-new compute on resume**, scoped to that **one
+> session** (isolated per session, 14-day idle expiry). It is **not** the same disk
+> staying alive, and **not** a channel to another session. For anything that must
+> truly outlive a session, both sides write to S3 (or AgentCore mounts EFS / S3 Files).
 
 > **The 8 h cap differs in kind between the two.**
 > - **MicroVM:** `maximumDurationInSeconds` counts **running + suspended together**

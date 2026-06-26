@@ -332,14 +332,16 @@ must never drop work — default to **persist + terminate**, never "do nothing".
 
 | | Lambda MicroVMs | AgentCore Runtime |
 |---|---|---|
-| Disk within a session | up to 32 GB, persists across suspend/resume | size not published; persists across stop/resume |
-| Survives the session's compute restart | none managed — write S3 | **managed session storage** (`/mnt/workspace`): restored when the **same** session resumes on new compute; **isolated per session**, 14-day idle expiry, reset on version update |
-| Durable / shared across sessions | S3 (write it yourself) | S3, or BYO EFS / S3 Files mounts (VPC required) |
+| Local disk (the compute's own) | up to 32 GB; destroyed when the VM terminates — not persistent | size not published; destroyed when the compute stops — not persistent |
+| Managed persistent mount | none — DIY (Mountpoint-for-S3 / EFS in your image) | native: managed session storage (`/mnt/workspace`, per-session, flush-on-stop / restore-on-resume, 14-day idle, reset on version update), or BYO EFS / S3 Files (shared, VPC required) |
+| Durable / shared store | S3 (write it yourself) | S3, or BYO EFS / S3 Files mounts (VPC required) |
 
-AgentCore's managed session storage only spans **one session's** stop/resume —
-it is per-session, not a way to pass data to another session. For anything that
-must outlive the session, both sides write to S3. Neither preserves **memory**
-state across the 8h boundary today.
+The local disk dies with the compute on both sides. AgentCore's `/mnt/workspace`
+"persists across stop/resume" by **flushing to a durable backend on stop and
+restoring onto a fresh compute on resume** — scoped to **one session** (isolated,
+not shared). It is not the same disk surviving, nor a channel between sessions.
+For anything that must outlive the session, both sides write to S3 (AgentCore can
+also mount EFS / S3 Files). Neither preserves **memory** state across 8h today.
 
 ---
 
