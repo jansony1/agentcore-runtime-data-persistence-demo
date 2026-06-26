@@ -56,8 +56,8 @@ flowchart TB
     RA -->|"③ start / stop sandbox"| CP
     RA -->|"④ run the generated shell / Python"| RB
     RA -.->|"live progress + report"| FE
-    RB <-->|"raw data / charts + CSV"| S3
-    RA -->|"final report.md"| S3
+    RB <-->|"raw data / charts + CSV"| ST
+    RA -->|"final report.md"| ST
 ```
 
 Each module, and what it does / does not do:

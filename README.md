@@ -36,8 +36,8 @@ flowchart TB
     RA -->|"③ start / tear down sandbox"| CP
     RA -->|"④ run the generated shell / Python"| RB
     RA -.->|"live progress + report stream"| FE
-    RB <-->|"download data / upload charts+CSV"| S3
-    RA -->|"upload final report.md"| S3
+    RB <-->|"download data / upload charts+CSV"| ST
+    RA -->|"upload final report.md"| ST
 ```
 
 Each module, and what it does / does not do:
@@ -76,6 +76,31 @@ installs or configures anything at runtime (the system prompt forbids it).
 
 See [DESIGN_V5.md](DESIGN_V5.md) for architecture, the 8-hour limit & roadmap
 notes, and the storage comparison vs AgentCore.
+
+## Why a Lambda MicroVM for Runtime B? (vs AgentCore Runtime)
+
+Both run the sandbox on Firecracker, so isolation is the same. The trade is
+**explicit control (MicroVM)** vs **zero-ops managed sessions (AgentCore)**.
+
+| | **Lambda MicroVM** (V5 Runtime B) | **AgentCore Runtime** (V3 Runtime B) |
+|---|---|---|
+| Isolation | Firecracker microVM | Firecracker microVM (same) |
+| Cold start | **~2.4s** measured (resume from snapshot) | not published; new-session cold start |
+| Lifecycle control | **explicit** — you `run` / `suspend` / `terminate`; idle policy is configurable | managed/opaque — platform reclaims on idle (~15 min) |
+| Session routing | you hold the endpoint + auth token per request | automatic via `runtimeSessionId` |
+| Max runtime | 8 h hard cap (running + suspended combined) | 8 h hard cap (`maxLifetime`) |
+| Streaming (SSE) | native on the endpoint | native |
+| In-VM disk | up to 32 GB, persists across suspend/resume | session disk, persists across stop/resume |
+| Durable / cross-session store | **none managed — write to S3** | **managed session storage** (`/mnt/workspace`, 14-day idle), can mount EFS / S3 Files |
+| Network bandwidth | tied to size (2 GB/1 vCPU ≈ 4 MB/s) | not size-throttled |
+| Dependencies | **pre-baked into the image snapshot** | installed in the container image |
+| Pre-built samples | code-server, kiro-reviewer (new, few) | mature AgentCore ecosystem |
+
+**Pick MicroVM when** you want explicit per-request sandboxes and lifecycle
+control (and don't mind managing the endpoint). **Pick AgentCore when** you want
+zero-ops session routing and a managed persistent workspace across calls.
+For >8 h work neither preserves memory across the boundary today — see the
+relay pattern and roadmap in [DESIGN_V5.md](DESIGN_V5.md).
 
 ## Prerequisites
 
