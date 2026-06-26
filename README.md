@@ -85,7 +85,7 @@ Both run the sandbox on Firecracker, so isolation is the same. The trade is
 | | **Lambda MicroVM** (V5 Runtime B) | **AgentCore Runtime** (V3 Runtime B) |
 |---|---|---|
 | Isolation | Firecracker microVM | Firecracker microVM (same) |
-| Cold start | **~2.4s** measured (resume from snapshot) | not published; new-session cold start |
+| Cold start | **~2.4s** measured `run_microvm`→`RUNNING`, 1s poll granularity (n=5: 2.25–2.52s) | not published |
 | Lifecycle control | **explicit** — you `run` / `suspend` / `terminate`; idle policy is configurable | managed/opaque — platform reclaims on idle (~15 min) |
 | Session routing | you hold the endpoint + auth token per request | automatic via `runtimeSessionId` |
 | Max runtime | 8 h hard cap (running + suspended combined) | 8 h hard cap (`maxLifetime`) |

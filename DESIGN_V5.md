@@ -163,7 +163,7 @@ Verified on AWS us-west-2: 10 status + 745 chunk + 1 done = 756 events, 184s, co
 ```mermaid
 stateDiagram-v2
     [*] --> PENDING: run_microvm
-    PENDING --> RUNNING: ~2.3s (snapshot resume)
+    PENDING --> RUNNING: ~2.4s measured (n=5: 2.25–2.52s)
     RUNNING --> RUNNING: Agent loop + report
     RUNNING --> TERMINATING: entrypoint finally → terminate_microvm
     TERMINATING --> TERMINATED: 磁盘+内存销毁 (不可恢复)
