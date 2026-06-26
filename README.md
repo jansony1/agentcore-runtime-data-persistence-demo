@@ -15,13 +15,13 @@ final report itself.
 flowchart TB
     FE["<b>Frontend</b>"]
 
-    RA["<b>Runtime A — orchestrator</b>"]
+    RA["<b>Orchestrator Runtime</b>"]
 
     BR["<b>Bedrock — the model (LLM)</b>"]
 
     CP["<b>MicroVM control plane</b>"]
 
-    RB["<b>Runtime B — the sandbox</b>"]
+    RB["<b>Sandbox Runtime</b>"]
 
     subgraph ST["<b>Storage</b> — interchangeable (S3 today)"]
         direction LR
@@ -45,21 +45,21 @@ Each module, and what it does / does not do:
 | Module | Does | Does NOT |
 |--------|------|----------|
 | **Frontend** | sends the question; renders live progress + the streaming report | any logic |
-| **Runtime A — orchestrator** | runs the agent loop; calls the model; starts/stops the sandbox; relays SSE; uploads the report | decide *content* by itself — the model does; touch data files |
+| **Orchestrator Runtime** | runs the agent loop; calls the model; starts/stops the sandbox; relays SSE; uploads the report | decide *content* by itself — the model does; touch data files |
 | **Bedrock — the model** | **decides each step and generates the shell/Python**, then writes the final report from the findings | execute anything — it only emits decisions + code + text |
 | **MicroVM control plane** | starts a fresh isolated sandbox on demand, tears it down when done | run user code |
-| **Runtime B — the sandbox** | executes the model's shell/Python in isolation: fetch data, compute, make charts | make any decision |
+| **Sandbox Runtime** | executes the model's shell/Python in isolation: fetch data, compute, make charts | make any decision |
 | **Storage** | holds per-tenant data in / results out; S3, ClickHouse, ES are interchangeable | — |
 
 What each connection carries, technically:
 
 | Connection | How |
 |------------|-----|
-| Frontend ↔ Runtime A | `invoke_agent_runtime`, replies as SSE (`status` / `chunk` / `done`) |
-| Runtime A ↔ Bedrock | `converse_stream`; the model picks a tool and generates its `command`/`code`, then writes the report |
-| Runtime A → control plane | `boto3 lambda-microvms`: run / poll / auth-token / terminate |
-| Runtime A → Runtime B | HTTPS + `X-aws-proxy-auth`; Runtime B exposes `:8080` shell/python, `:9000` lifecycle hooks |
-| Runtime B ↔ Storage / Runtime A → Storage | `aws cli` for data, `put_object` for the report (S3 today) |
+| Frontend ↔ Orchestrator | `invoke_agent_runtime`, replies as SSE (`status` / `chunk` / `done`) |
+| Orchestrator ↔ Bedrock | `converse_stream`; the model picks a tool and generates its `command`/`code`, then writes the report |
+| Orchestrator → control plane | `boto3 lambda-microvms`: run / poll / auth-token / terminate |
+| Orchestrator → Sandbox | HTTPS + `X-aws-proxy-auth`; Sandbox exposes `:8080` shell/python, `:9000` lifecycle hooks |
+| Sandbox ↔ Storage / Orchestrator → Storage | `aws cli` for data, `put_object` for the report (S3 today) |
 
 > Runtime B's image is **pre-baked** with python + pandas/numpy/matplotlib + aws cli + CJK fonts,
 > so the sandbox installs nothing at request time.
@@ -82,19 +82,29 @@ notes, and the storage comparison vs AgentCore.
 Both run the sandbox on Firecracker, so isolation is the same. The trade is
 **explicit control (MicroVM)** vs **zero-ops managed sessions (AgentCore)**.
 
-| | **Lambda MicroVM** (V5 Runtime B) | **AgentCore Runtime** (V3 Runtime B) |
+| | **Lambda MicroVM** (V5 sandbox) | **AgentCore Runtime** (V3 sandbox) |
 |---|---|---|
 | Isolation | Firecracker microVM | Firecracker microVM (same) |
-| Cold start | **~2.4s** measured `run_microvm`→`RUNNING`, 1s poll granularity (n=5: 2.25–2.52s) | not published |
+| Cold start (call → serving) | **~1.5–1.9s** measured (n=4): `run_microvm`→`RUNNING` ~1.3–1.6s + token + first health 200 | **~4.3s** (light image) to **~9.5s** (heavy image) measured on a fresh session; **~0.5–0.7s** if it lands on a warm-pool microVM; **~0.1–0.2s** warm same-session |
+| Invocation / params | HTTPS `POST` to the VM endpoint with `X-aws-proxy-auth`; params in the JSON body (`{"action":"shell","command":...}`) | `bedrock-agentcore invoke_agent_runtime(agentRuntimeArn, runtimeSessionId, payload=<json bytes>)`; params in the payload |
 | Lifecycle control | **explicit** — you `run` / `suspend` / `terminate`; idle policy is configurable | managed/opaque — platform reclaims on idle (~15 min) |
 | Session routing | you hold the endpoint + auth token per request | automatic via `runtimeSessionId` |
 | Max runtime | 8 h hard cap (running + suspended combined) | 8 h hard cap (`maxLifetime`) |
 | Streaming (SSE) | native on the endpoint | native |
-| In-VM disk | up to 32 GB, persists across suspend/resume | session disk, persists across stop/resume |
-| Durable / cross-session store | **none managed — write to S3** | **managed session storage** (`/mnt/workspace`, 14-day idle), can mount EFS / S3 Files |
+| In-VM disk (this session only) | up to **32 GB**, persists across suspend/resume | size **not published**; ephemeral, persists for the session lifecycle |
+| Durable store (survives the VM, across sessions) | **none managed — write to S3** | **managed session storage** (`/mnt/workspace`, survives stop/resume, 14-day idle expiry); can also mount EFS / S3 Files |
 | Network bandwidth | tied to size (2 GB/1 vCPU ≈ 4 MB/s) | not size-throttled |
 | Dependencies | **pre-baked into the image snapshot** | installed in the container image |
-| Pre-built samples | code-server, kiro-reviewer (new, few) | mature AgentCore ecosystem |
+
+> Cold-start numbers are wall-clock from the bastion (same-region, RTT ~10ms);
+> AWS publishes no figure for either. AgentCore's cold cost is dominated by
+> per-session attach + app import, not microVM boot, so it scales with image weight.
+
+**The two storage rows differ in scope:** *In-VM disk* is the sandbox's own
+`/tmp/workspace`, scoped to **one VM / one session** — it disappears when that VM
+ends. *Durable store* is what outlives the VM and is reachable **across sessions**
+(still the same tenant — neither crosses tenants). MicroVM has no managed durable
+layer, so V5 writes results to S3; AgentCore offers a managed `/mnt/workspace`.
 
 **Pick MicroVM when** you want explicit per-request sandboxes and lifecycle
 control (and don't mind managing the endpoint). **Pick AgentCore when** you want

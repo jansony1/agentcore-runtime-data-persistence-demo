@@ -102,7 +102,7 @@ sequenceDiagram
     rect rgb(238,244,255)
     note over A,CP: ① start the MicroVM
     A->>CP: run_microvm
-    CP-->>A: state RUNNING (~2.4s)
+    CP-->>A: state RUNNING (~1.5s)
     A->>CP: create_microvm_auth_token
     A-->>FE: status "MicroVM 就绪"
     end
@@ -138,7 +138,9 @@ sequenceDiagram
     end
 ```
 
-Verified on AWS us-west-2: 10 status + 745 chunk + 1 done = 756 events, 184s, cold start 2.25s.
+Verified on AWS us-west-2: 10 status + 745 chunk + 1 done = 756 events, 184s.
+(The 2.25s the deployed Orchestrator logged below is its coarse 1s-poll loop; a
+fine-grained probe measures cold start at ~1.5–1.9s call→serving — see README.)
 
 ### SSE event stream (actual output)
 
@@ -163,7 +165,7 @@ Verified on AWS us-west-2: 10 status + 745 chunk + 1 done = 756 events, 184s, co
 ```mermaid
 stateDiagram-v2
     [*] --> PENDING: run_microvm
-    PENDING --> RUNNING: ~2.4s measured (n=5: 2.25–2.52s)
+    PENDING --> RUNNING: ~1.3–1.6s measured (call→serving ~1.5–1.9s)
     RUNNING --> RUNNING: Agent loop + report
     RUNNING --> TERMINATING: entrypoint finally → terminate_microvm
     TERMINATING --> TERMINATED: 磁盘+内存销毁 (不可恢复)
@@ -213,8 +215,8 @@ add minutes per request and often fail. The system prompt explicitly forbids
 When you call `create-microvm-image`, Lambda runs your `Dockerfile` once,
 starts the app, and takes a Firecracker snapshot of the fully-initialized
 memory+disk. Every `run-microvm` resumes from that snapshot — packages, fonts,
-and aws cli are already present. This is the same reason cold start is ~2.4s
-(resume, not boot+install).
+and aws cli are already present. This is the same reason cold start is ~1.5–1.9s
+(resume from the image snapshot, not boot+install).
 
 ### What is baked in (`runtime_b_v5/Dockerfile`)
 
@@ -326,7 +328,7 @@ must never drop work — default to **persist + terminate**, never "do nothing".
 
 | | Lambda MicroVMs | AgentCore Runtime |
 |---|---|---|
-| In-VM disk | 32 GB, persists across suspend/resume | session disk, persists across stop/resume |
+| In-VM disk | up to 32 GB, persists across suspend/resume | size not published; persists across stop/resume |
 | Cross-VM / durable | **none managed — must write S3** | **managed session storage** (`/mnt/workspace`, survives stop/resume, 14-day idle expiry); can also mount EFS / S3 Files |
 | Mountable volumes | DIY Mountpoint-for-S3 only (read-friendly) | managed S3 Files / EFS |
 
