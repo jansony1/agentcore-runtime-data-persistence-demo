@@ -43,21 +43,21 @@ flowchart TB
 
     RB["<b>Runtime B — the sandbox</b> (Lambda MicroVM)"]
 
-    subgraph ST["<b>Storage</b> (interchangeable)"]
+    subgraph ST["<b>Storage</b> — interchangeable (S3 today)"]
         direction LR
-        S3[("S3")]
+        S3[("&nbsp;&nbsp;S3&nbsp;&nbsp;")]
         CH[("ClickHouse")]
         ES[("Elasticsearch")]
+        S3 ~~~ CH ~~~ ES
     end
 
     FE -->|"① ask"| RA
-    RA <-->|"② decide next step +<br/>generate shell / Python"| BR
+    RA <-->|"② decide each step +<br/>generate shell / Python,<br/>then write the report"| BR
     RA -->|"③ start / stop sandbox"| CP
     RA -->|"④ run the generated shell / Python"| RB
-    RA <-->|"⑤ send findings, get report"| BR
-    RB <-->|"raw data / charts + CSV"| ST
-    RA -->|"final report.md"| ST
     RA -.->|"live progress + report"| FE
+    RB <-->|"raw data / charts + CSV"| S3
+    RA -->|"final report.md"| S3
 ```
 
 Each module, and what it does / does not do:
