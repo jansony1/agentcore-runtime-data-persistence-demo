@@ -91,8 +91,8 @@ Both run the sandbox on Firecracker, so isolation is the same. The trade is
 | Session routing | you hold the endpoint + auth token per request | automatic via `runtimeSessionId` |
 | Max runtime | 8 h hard cap (running + suspended combined) | 8 h hard cap (`maxLifetime`) |
 | Streaming (SSE) | native on the endpoint | native |
-| In-VM disk (this session only) | up to **32 GB**, persists across suspend/resume | size **not published**; ephemeral, persists for the session lifecycle |
-| Durable store (survives the VM, across sessions) | **none managed — write to S3** | **managed session storage** (`/mnt/workspace`, survives stop/resume, 14-day idle expiry); can also mount EFS / S3 Files |
+| Disk within a session | up to **32 GB**, persists across suspend/resume | size **not published**; persists across stop/resume |
+| Durable result store | **write to S3** (results land in `tenants/{id}/reports/`) | same — write to S3 (or a managed `/mnt/workspace`, but it's per-session, not shared) |
 | Network bandwidth | tied to size (2 GB/1 vCPU ≈ 4 MB/s) | not size-throttled |
 | Dependencies | **pre-baked into the image snapshot** | installed in the container image |
 
@@ -100,17 +100,16 @@ Both run the sandbox on Firecracker, so isolation is the same. The trade is
 > AWS publishes no figure for either. AgentCore's cold cost is dominated by
 > per-session attach + app import, not microVM boot, so it scales with image weight.
 
-**The two storage rows differ in scope:** *In-VM disk* is the sandbox's own
-`/tmp/workspace`, scoped to **one VM / one session** — it disappears when that VM
-ends. *Durable store* is what outlives the VM and is reachable **across sessions**
-(still the same tenant — neither crosses tenants). MicroVM has no managed durable
-layer, so V5 writes results to S3; AgentCore offers a managed `/mnt/workspace`.
+> **Disk scope (both sides):** the sandbox disk lives and dies with the session —
+> it is **not** a way to hand data to a later session. Anything that must survive
+> goes to S3. AgentCore's managed `/mnt/workspace` only extends this within one
+> session's stop/resume cycle; it is isolated per session, not shared across them.
 
 **Pick MicroVM when** you want explicit per-request sandboxes and lifecycle
 control (and don't mind managing the endpoint). **Pick AgentCore when** you want
-zero-ops session routing and a managed persistent workspace across calls.
-For >8 h work neither preserves memory across the boundary today — see the
-relay pattern and roadmap in [DESIGN_V5.md](DESIGN_V5.md).
+zero-ops session routing. For >8 h work neither preserves state across the
+boundary without writing to S3 — see the relay pattern and roadmap in
+[DESIGN_V5.md](DESIGN_V5.md).
 
 ## Prerequisites
 

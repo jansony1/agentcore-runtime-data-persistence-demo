@@ -328,13 +328,14 @@ must never drop work — default to **persist + terminate**, never "do nothing".
 
 | | Lambda MicroVMs | AgentCore Runtime |
 |---|---|---|
-| In-VM disk | up to 32 GB, persists across suspend/resume | size not published; persists across stop/resume |
-| Cross-VM / durable | **none managed — must write S3** | **managed session storage** (`/mnt/workspace`, survives stop/resume, 14-day idle expiry); can also mount EFS / S3 Files |
-| Mountable volumes | DIY Mountpoint-for-S3 only (read-friendly) | managed S3 Files / EFS |
+| Disk within a session | up to 32 GB, persists across suspend/resume | size not published; persists across stop/resume |
+| Survives the session's compute restart | none managed — write S3 | **managed session storage** (`/mnt/workspace`): restored when the **same** session resumes on new compute; **isolated per session**, 14-day idle expiry, reset on version update |
+| Durable / shared across sessions | S3 (write it yourself) | S3, or BYO EFS / S3 Files mounts (VPC required) |
 
-For >8h checkpointable work, AgentCore's managed session storage auto-reattaches
-disk to the next compute — MicroVMs require DIY S3 checkpointing until snapshot-to-S3 ships.
-Neither preserves **memory** state across the 8h boundary today.
+AgentCore's managed session storage only spans **one session's** stop/resume —
+it is per-session, not a way to pass data to another session. For anything that
+must outlive the session, both sides write to S3. Neither preserves **memory**
+state across the 8h boundary today.
 
 ---
 
