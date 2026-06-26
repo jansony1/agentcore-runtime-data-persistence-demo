@@ -85,21 +85,23 @@ Both run the sandbox on Firecracker, so isolation is the same. The trade is
 | | **Lambda MicroVM** (V5 sandbox) | **AgentCore Runtime** (V3 sandbox) |
 |---|---|---|
 | Isolation | Firecracker microVM | Firecracker microVM (same) |
-| Cold start (call → serving) | **~1.5–1.9s** measured (n=4): `run_microvm`→`RUNNING` ~1.3–1.6s + token + first health 200 | **~4.3s** (light image) to **~9.5s** (heavy image) measured on a fresh session; **~0.5–0.7s** if it lands on a warm-pool microVM; **~0.1–0.2s** warm same-session |
+| Cold start (service-side startup) | **~1.3–1.6s** — `run_microvm` → `RUNNING` provisioning (n=4) | **~4.3s** (light image) to **~9.5s** (heavy image) on a fresh session; **~0.5–0.7s** on a warm-pool microVM; **~0.1–0.2s** warm same-session |
 | Invocation / params | HTTPS `POST` to the VM endpoint with `X-aws-proxy-auth`; params in the JSON body (`{"action":"shell","command":...}`) | `bedrock-agentcore invoke_agent_runtime(agentRuntimeArn, runtimeSessionId, payload=<json bytes>)`; params in the payload |
 | Lifecycle control | **explicit** — you `run` / `suspend` / `terminate`; idle policy (`maxIdleDurationSeconds`, `suspendedDurationSeconds`) is configurable | **managed** — the compute is kept alive while your `/ping` returns `HealthyBusy`, auto-suspended after ~15 min `Healthy` (idle); `StopRuntimeSession` to stop early |
 | Session routing | you hold the endpoint + auth token per request | automatic via `runtimeSessionId` |
 | Max runtime | **8 h hard cap per VM, terminal** — running + suspended combined; suspend does NOT reset it; on expiry the VM is destroyed and you must start a new one | **8 h per compute, but the session survives** — at 8 h the compute is recycled; the next invocation auto-provisions a **fresh compute (another 8 h)**, and the session stays valid until the runtime ARN is deleted |
 | Streaming (SSE) | native on the endpoint | native |
 | Local disk (the compute's own) | up to **32 GB**; **destroyed when the VM terminates** (incl. at the 8 h cap) — not persistent | size **not published**; **destroyed when the compute is terminated/stopped** — not persistent |
-| Managed persistent mount | **none** — DIY only (Mountpoint-for-S3 / EFS in your image), so V5 just `aws s3 cp` to S3 | **native `filesystemConfigurations`** (no mount code): managed **session storage** (`/mnt/workspace`, per-session, flushed to a durable backend on stop and restored on resume), or BYO **EFS** / **S3 Files** mounts (shared across sessions/agents, VPC required) |
+| Mountable filesystems | **no managed mount** — DIY only: **EFS** via a VPC egress connector + NFS 2049 + `additionalOsCapabilities:["ALL"]` (`mount -t nfs4` in the `/run` hook); **S3** via Mountpoint-for-S3 (FUSE, no-append/no-rename limits). V5 skips both and just `aws s3 cp` to S3 | **native `filesystemConfigurations`**, no mount code: managed **session storage** (`/mnt/workspace`, per-session, flush-on-stop / restore-on-resume), or BYO **EFS** / **S3 Files** mounts (shared across sessions/agents, VPC required) |
 | Durable result store | **S3** (results land in `tenants/{id}/reports/`) | **S3** too, plus the mounts above |
 | Network bandwidth | tied to size (2 GB/1 vCPU ≈ 4 MB/s) | not size-throttled |
 | Dependencies | **pre-baked into the image snapshot** | installed in the container image |
 
-> Cold-start numbers are wall-clock from the bastion (same-region, RTT ~10ms);
-> AWS publishes no figure for either. AgentCore's cold cost is dominated by
-> per-session attach + app import, not microVM boot, so it scales with image weight.
+> Cold start = **service-side startup only** (provisioning until the VM is
+> serving); client↔service network round-trips are excluded (same-region RTT
+> ~10 ms is negligible at this scale). AWS publishes no figure for either.
+> AgentCore's cold cost is dominated by per-session attach + app import, not
+> microVM boot, so it scales with image weight.
 
 > **What actually survives a restart:** the compute's **local disk does not** — it
 > is destroyed with the VM on both sides. AgentCore's `/mnt/workspace` looks like

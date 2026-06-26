@@ -140,7 +140,8 @@ sequenceDiagram
 
 Verified on AWS us-west-2: 10 status + 745 chunk + 1 done = 756 events, 184s.
 (The 2.25s the deployed Orchestrator logged below is its coarse 1s-poll loop; a
-fine-grained probe measures cold start at ~1.5–1.9s call→serving — see README.)
+fine-grained probe measures service-side startup (`run_microvm`→`RUNNING`) at
+~1.3–1.6s — see README.)
 
 ### SSE event stream (actual output)
 
@@ -165,7 +166,7 @@ fine-grained probe measures cold start at ~1.5–1.9s call→serving — see REA
 ```mermaid
 stateDiagram-v2
     [*] --> PENDING: run_microvm
-    PENDING --> RUNNING: ~1.3–1.6s measured (call→serving ~1.5–1.9s)
+    PENDING --> RUNNING: ~1.3–1.6s (service-side provisioning)
     RUNNING --> RUNNING: Agent loop + report
     RUNNING --> TERMINATING: entrypoint finally → terminate_microvm
     TERMINATING --> TERMINATED: 磁盘+内存销毁 (不可恢复)
@@ -215,8 +216,8 @@ add minutes per request and often fail. The system prompt explicitly forbids
 When you call `create-microvm-image`, Lambda runs your `Dockerfile` once,
 starts the app, and takes a Firecracker snapshot of the fully-initialized
 memory+disk. Every `run-microvm` resumes from that snapshot — packages, fonts,
-and aws cli are already present. This is the same reason cold start is ~1.5–1.9s
-(resume from the image snapshot, not boot+install).
+and aws cli are already present. This is the same reason service-side startup is
+~1.3–1.6s (resume from the image snapshot, not boot+install).
 
 ### What is baked in (`runtime_b_v5/Dockerfile`)
 
@@ -333,7 +334,7 @@ must never drop work — default to **persist + terminate**, never "do nothing".
 | | Lambda MicroVMs | AgentCore Runtime |
 |---|---|---|
 | Local disk (the compute's own) | up to 32 GB; destroyed when the VM terminates — not persistent | size not published; destroyed when the compute stops — not persistent |
-| Managed persistent mount | none — DIY (Mountpoint-for-S3 / EFS in your image) | native: managed session storage (`/mnt/workspace`, per-session, flush-on-stop / restore-on-resume, 14-day idle, reset on version update), or BYO EFS / S3 Files (shared, VPC required) |
+| Mountable filesystems | no managed mount — DIY: EFS via VPC egress connector + NFS 2049 + `["ALL"]` caps (mount in `/run` hook); S3 via Mountpoint-for-S3 FUSE (no-append/no-rename) | native: managed session storage (`/mnt/workspace`, per-session, flush-on-stop / restore-on-resume, 14-day idle, reset on version update), or BYO EFS / S3 Files (shared, VPC required) |
 | Durable / shared store | S3 (write it yourself) | S3, or BYO EFS / S3 Files mounts (VPC required) |
 
 The local disk dies with the compute on both sides. AgentCore's `/mnt/workspace`
