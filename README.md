@@ -87,9 +87,9 @@ Both run the sandbox on Firecracker, so isolation is the same. The trade is
 | Isolation | Firecracker microVM | Firecracker microVM (same) |
 | Cold start (call → serving) | **~1.5–1.9s** measured (n=4): `run_microvm`→`RUNNING` ~1.3–1.6s + token + first health 200 | **~4.3s** (light image) to **~9.5s** (heavy image) measured on a fresh session; **~0.5–0.7s** if it lands on a warm-pool microVM; **~0.1–0.2s** warm same-session |
 | Invocation / params | HTTPS `POST` to the VM endpoint with `X-aws-proxy-auth`; params in the JSON body (`{"action":"shell","command":...}`) | `bedrock-agentcore invoke_agent_runtime(agentRuntimeArn, runtimeSessionId, payload=<json bytes>)`; params in the payload |
-| Lifecycle control | **explicit** — you `run` / `suspend` / `terminate`; idle policy is configurable | managed/opaque — platform reclaims on idle (~15 min) |
+| Lifecycle control | **explicit** — you `run` / `suspend` / `terminate`; idle policy (`maxIdleDurationSeconds`, `suspendedDurationSeconds`) is configurable | **managed** — the compute is kept alive while your `/ping` returns `HealthyBusy`, auto-suspended after ~15 min `Healthy` (idle); `StopRuntimeSession` to stop early |
 | Session routing | you hold the endpoint + auth token per request | automatic via `runtimeSessionId` |
-| Max runtime | 8 h hard cap — **running + suspended combined; suspend does NOT reset it** | 8 h hard cap (`maxLifetime`) |
+| Max runtime | **8 h hard cap per VM, terminal** — running + suspended combined; suspend does NOT reset it; on expiry the VM is destroyed and you must start a new one | **8 h per compute, but the session survives** — at 8 h the compute is recycled; the next invocation auto-provisions a **fresh compute (another 8 h)**, and the session stays valid until the runtime ARN is deleted |
 | Streaming (SSE) | native on the endpoint | native |
 | Disk within a session | up to **32 GB**, persists across suspend/resume | size **not published**; persists across stop/resume |
 | Durable result store | **write to S3** (results land in `tenants/{id}/reports/`) | same — write to S3 (or a managed `/mnt/workspace`, but it's per-session, not shared) |
@@ -105,20 +105,23 @@ Both run the sandbox on Firecracker, so isolation is the same. The trade is
 > goes to S3. AgentCore's managed `/mnt/workspace` only extends this within one
 > session's stop/resume cycle; it is isolated per session, not shared across them.
 
-> **The 8 h cap and suspend/resume don't conflict — but suspend doesn't buy time.**
-> `maximumDurationInSeconds` counts **running + suspended together** from
-> `run_microvm`; suspending pauses billing, not the clock. Example: run 7 h →
-> suspend → resume leaves **~1 h**, not a fresh 8 h. To exceed 8 h today you start
-> a new VM and restore from S3 (the relay pattern in [DESIGN_V5.md](DESIGN_V5.md)).
-> **Roadmap:** AWS's planned **snapshot-to-S3 + restore** will solve this directly —
-> snapshot the full VM (memory + disk) to S3 and restore into a fresh-lease VM,
-> carrying state a new VM otherwise can't.
+> **The 8 h cap differs in kind between the two.**
+> - **MicroVM:** `maximumDurationInSeconds` counts **running + suspended together**
+>   from `run_microvm`; suspend pauses billing, not the clock (run 7 h → resume →
+>   ~1 h left). At 8 h the VM is **terminated — terminal**. To go past 8 h *today*
+>   you start a new VM and restore from S3 (relay pattern in [DESIGN_V5.md](DESIGN_V5.md));
+>   AWS's planned **snapshot-to-S3 + restore** will solve this directly by carrying
+>   full VM state (memory + disk) into a fresh-lease VM.
+> - **AgentCore:** 8 h is **per compute, not per session**. At 8 h the compute is
+>   recycled; the next invocation **auto-provisions a fresh compute (another 8 h)**
+>   and — if session storage is configured — restores `/mnt/workspace`. The session
+>   stays alive until you delete the runtime. So AgentCore does the compute-relay
+>   for you (disk only; memory is not preserved).
 
 **Pick MicroVM when** you want explicit per-request sandboxes and lifecycle
-control (and don't mind managing the endpoint). **Pick AgentCore when** you want
-zero-ops session routing. For >8 h work neither preserves state across the
-boundary without writing to S3 — see the relay pattern and roadmap in
-[DESIGN_V5.md](DESIGN_V5.md).
+control (and don't mind managing the endpoint + your own >8 h relay). **Pick
+AgentCore when** you want zero-ops session routing and automatic compute recycling
+across the 8 h boundary. Neither preserves **memory** across that boundary today.
 
 ## Prerequisites
 

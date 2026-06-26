@@ -285,8 +285,12 @@ load** (`_configure_cjk_font()`), so chart code needs no font handling.
   counts toward the 8h.
 - On reaching the limit the MicroVM goes to `TERMINATED`, a **terminal state**:
   "cannot be resumed or restarted." Disk and memory are destroyed.
-- **AgentCore Runtime has the identical 8h cap** (`maxLifetime` default 8h), so
-  this is not a MicroVM-specific regression — it is inherent to both.
+- **AgentCore's 8h is different in kind**: it caps the *compute* (`maxLifetime`),
+  not the *session*. At 8h the compute is recycled, but the next invocation
+  auto-provisions a **fresh compute (another 8h)** and restores managed session
+  storage; the session stays valid until the runtime ARN is deleted. So AgentCore
+  performs the compute-relay automatically (disk only, not memory) — on MicroVM
+  you build that relay yourself until snapshot-to-S3 ships.
 
 ### How to continue past 8h (today): the relay pattern
 
