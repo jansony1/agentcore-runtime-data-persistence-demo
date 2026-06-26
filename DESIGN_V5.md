@@ -27,45 +27,59 @@ Runtime B is a pure executor) — but makes two structural changes:
 
 ## Architecture — components
 
-Each box states what that component is *for*; each arrow is an action. The four
-external pieces — the **control plane** (an API that starts/stops sandboxes),
-the **sandbox** itself, **Bedrock**, and **S3** — are separate things.
+The model (Bedrock) is what decides each step **and generates the shell/Python**;
+Runtime A only orchestrates. Storage is a swappable layer — S3 today, but
+ClickHouse / ES could stand in without touching the brain.
 
 ```mermaid
 flowchart TB
-    FE["<b>Frontend</b><br/><i>sends the question,<br/>watches progress + report live</i>"]
+    FE["<b>Frontend</b>"]
 
-    RA["<b>Runtime A — the brain</b> (AgentCore)<br/><i>understands the request, decides every step,<br/>commands the sandbox, writes the final report.<br/>Never touches data files itself.</i>"]
+    RA["<b>Runtime A — orchestrator</b> (AgentCore)"]
 
-    CP["<b>MicroVM control plane</b><br/><i>starts a fresh isolated sandbox on demand,<br/>shuts it down when done</i>"]
+    BR["<b>Bedrock — the model (LLM)</b>"]
 
-    RB["<b>Runtime B — the sandbox</b> (Lambda MicroVM)<br/><i>runs the brain's shell/Python in isolation:<br/>fetches data, computes, makes charts.<br/>Makes no decisions.</i>"]
+    CP["<b>MicroVM control plane</b>"]
 
-    BR["<b>Bedrock (Opus)</b><br/><i>the LLM that reasons<br/>and writes the report</i>"]
+    RB["<b>Runtime B — the sandbox</b> (Lambda MicroVM)"]
 
-    S3[("<b>S3</b><br/><i>per-tenant data in,<br/>results out</i>")]
-    ALT[("<b>or ClickHouse / ES</b><br/><i>swap in another store<br/>without touching the brain</i>")]
+    subgraph ST["<b>Storage</b> (interchangeable)"]
+        direction LR
+        S3[("S3")]
+        CH[("ClickHouse")]
+        ES[("Elasticsearch")]
+    end
 
     FE -->|"① ask"| RA
-    RA -->|"② start / stop a sandbox"| CP
-    RA -->|"③ prepare data (shell / Python)"| RB
-    RA -->|"④ reason, then write report"| BR
-    RB <-->|"raw data / charts + CSV"| S3
-    RA -->|"final report.md"| S3
+    RA <-->|"② decide next step +<br/>generate shell / Python"| BR
+    RA -->|"③ start / stop sandbox"| CP
+    RA -->|"④ run the generated shell / Python"| RB
+    RA <-->|"⑤ send findings, get report"| BR
+    RB <-->|"raw data / charts + CSV"| ST
+    RA -->|"final report.md"| ST
     RA -.->|"live progress + report"| FE
-    S3 -.->|"interchangeable<br/>data store"| ALT
 ```
+
+Each module, and what it does / does not do:
+
+| Module | Does | Does NOT |
+|--------|------|----------|
+| **Frontend** | sends the question; renders live progress + streaming report | any logic |
+| **Runtime A — orchestrator** | runs the agent loop, calls the model, starts/stops the sandbox, relays SSE, uploads the report | decide content itself; touch data files |
+| **Bedrock — the model** | **decides each step and generates the shell/Python**, then writes the report from the findings | execute anything |
+| **MicroVM control plane** | starts a fresh isolated sandbox on demand, tears it down when done | run user code |
+| **Runtime B — the sandbox** | executes the model's shell/Python in isolation: fetch data, compute, make charts | make decisions |
+| **Storage** | per-tenant data in / results out; S3, ClickHouse, ES interchangeable | — |
 
 What each connection carries, technically:
 
 | Connection | How |
 |------------|-----|
 | Frontend ↔ Runtime A | `invoke_agent_runtime`, replies as SSE (`status` / `chunk` / `done`) |
+| Runtime A ↔ Bedrock | `converse_stream`; the model picks a tool and generates its `command`/`code` during data prep, then writes the report |
 | Runtime A → control plane | `boto3 lambda-microvms`: `RunMicrovm` / `GetMicrovm` / `CreateAuthToken` / `Terminate` |
 | Runtime A → Runtime B | HTTPS + `X-aws-proxy-auth`; Runtime B exposes `:8080` shell/python, `:9000` lifecycle hooks, `/tmp/workspace` disk |
-| Runtime A → Bedrock | `converse_stream` (agent reasoning during data prep, then the report) |
-| Runtime B ↔ S3 | `aws cli`: download `tenants/{id}/datasets`, upload chart+CSV |
-| Runtime A → S3 | `put_object`: final `tenants/{id}/reports/analysis_report.md` |
+| Runtime B ↔ Storage / Runtime A → Storage | `aws cli` for data, `put_object` for the report — `tenants/{id}/datasets` in, `tenants/{id}/reports/analysis_report.md` out (S3 today) |
 
 ---
 

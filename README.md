@@ -11,42 +11,55 @@ final report itself.
 
 ## Architecture
 
-Each box = one responsibility; each arrow = one action.
-
 ```mermaid
 flowchart TB
-    FE["Frontend<br/><i>sends the question,<br/>watches progress + report live</i>"]
+    FE["<b>Frontend</b>"]
 
-    RA["<b>Runtime A — the brain</b><br/><i>understands the request, decides every step,<br/>commands the sandbox, writes the final report.<br/>Never touches data files itself.</i>"]
+    RA["<b>Runtime A — orchestrator</b>"]
 
-    CP["<b>MicroVM control plane</b><br/><i>starts a fresh, isolated sandbox on demand<br/>and shuts it down when done</i>"]
+    BR["<b>Bedrock — the model (LLM)</b>"]
 
-    RB["<b>Runtime B — the sandbox</b><br/><i>runs the brain's shell/Python in isolation:<br/>fetches data, computes, makes charts.<br/>Makes no decisions.</i>"]
+    CP["<b>MicroVM control plane</b>"]
 
-    BR["<b>Bedrock (Opus)</b><br/><i>the LLM that thinks<br/>and writes the report</i>"]
+    RB["<b>Runtime B — the sandbox</b>"]
 
-    S3[("<b>S3</b><br/><i>per-tenant data in,<br/>results out</i>")]
-    ALT[("<b>or ClickHouse / ES</b><br/><i>swap in another store<br/>without touching the brain</i>")]
+    subgraph ST["<b>Storage</b> (interchangeable)"]
+        direction LR
+        S3[("S3")]
+        CH[("ClickHouse")]
+        ES[("Elasticsearch")]
+    end
 
     FE -->|"① ask: analyze Q1 sales..."| RA
-    RA -->|"② spin up / tear down a sandbox"| CP
-    RA -->|"③ prepare data: run shell / Python"| RB
-    RA -->|"④ think (decide steps) + write report"| BR
-    RB <-->|"download raw data / upload charts+CSV"| S3
-    RA -->|"upload final report.md"| S3
+    RA <-->|"② decide next step +<br/>generate shell / Python"| BR
+    RA -->|"③ start / tear down sandbox"| CP
+    RA -->|"④ run the generated shell / Python"| RB
+    RA <-->|"⑤ send findings, get report"| BR
+    RB <-->|"download data / upload charts+CSV"| ST
+    RA -->|"upload final report.md"| ST
     RA -.->|"live progress + report stream"| FE
-    S3 -.->|"interchangeable<br/>data store"| ALT
 ```
+
+Each module, and what it does / does not do:
+
+| Module | Does | Does NOT |
+|--------|------|----------|
+| **Frontend** | sends the question; renders live progress + the streaming report | any logic |
+| **Runtime A — orchestrator** | runs the agent loop; calls the model; starts/stops the sandbox; relays SSE; uploads the report | decide *content* by itself — the model does; touch data files |
+| **Bedrock — the model** | **decides each step and generates the shell/Python**, then writes the final report from the findings | execute anything — it only emits decisions + code + text |
+| **MicroVM control plane** | starts a fresh isolated sandbox on demand, tears it down when done | run user code |
+| **Runtime B — the sandbox** | executes the model's shell/Python in isolation: fetch data, compute, make charts | make any decision |
+| **Storage** | holds per-tenant data in / results out; S3, ClickHouse, ES are interchangeable | — |
 
 What each connection carries, technically:
 
-| Arrow | How | 
-|-------|-----|
+| Connection | How |
+|------------|-----|
 | Frontend ↔ Runtime A | `invoke_agent_runtime`, replies as SSE (`status` / `chunk` / `done`) |
+| Runtime A ↔ Bedrock | `converse_stream`; the model picks a tool and generates its `command`/`code`, then writes the report |
 | Runtime A → control plane | `boto3 lambda-microvms`: run / poll / auth-token / terminate |
 | Runtime A → Runtime B | HTTPS + `X-aws-proxy-auth`; Runtime B exposes `:8080` shell/python, `:9000` lifecycle hooks |
-| Runtime A → Bedrock | `converse_stream` (agent reasoning, then report) |
-| Runtime B ↔ S3 / Runtime A → S3 | `aws cli` for data, `put_object` for the report |
+| Runtime B ↔ Storage / Runtime A → Storage | `aws cli` for data, `put_object` for the report (S3 today) |
 
 > Runtime B's image is **pre-baked** with python + pandas/numpy/matplotlib + aws cli + CJK fonts,
 > so the sandbox installs nothing at request time.
